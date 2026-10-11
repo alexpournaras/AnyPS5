@@ -89,7 +89,15 @@ private:
 // A configuration whose stage has no variant id gets a private pipeline. Entries are LRU-bounded and
 // only evicted once no recorded draw holds them. Debug aid: APS5_NO_PIPELINE_CACHE=1 builds one per
 // draw as before.
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+// With `defer` (APS5_ASYNC_PIPELINES=1, see AsyncPipelines) a configuration not built yet is built
+// on a background thread from copies of the inputs, with `defer` keeping the resources alive, and
+// the call returns null until it is ready: the caller skips its draw meanwhile. Without it a call
+// waits for a background build of its configuration rather than starting another.
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, const std::shared_ptr<const ShaderResources>* defer = nullptr);
+// APS5_ASYNC_PIPELINES=1: draws that write no guest memory skip themselves while their pipeline is
+// built in the background, instead of stalling the recording for the driver's compile (100-300 ms
+// for a new shader on NVIDIA); the object then appears a few frames late.
+bool AsyncPipelines();
 // Destroys the cached pipelines of a device; to be called before the device goes away. Without it,
 // entries of a gone device are recognised by their buffer pool (made and reset with the device, so
 // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.

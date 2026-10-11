@@ -8,6 +8,10 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <list>
@@ -676,8 +680,66 @@ struct PipelineStore {
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
     std::uint64_t evicted = 0;
+    std::uint64_t deferred = 0;
+    // Signalled when a background build fills in (or drops) its entry, whose pipeline is null
+    // while it runs.
+    std::condition_variable_any built;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
+
+// The threads that build pipelines for CachedPipeline's deferred misses, started on first use.
+class PipelineBuilders {
+public:
+    void Run(std::function<void()> job) {
+        {
+            std::lock_guard lock(mutex);
+            if (threads.empty()) {
+                const auto count = std::clamp(std::thread::hardware_concurrency() / 6u, 2u, 4u);
+                for (unsigned i = 0; i < count; ++i) threads.emplace_back([this](std::stop_token token) { loop(token); });
+            }
+            jobs.push_back(std::move(job));
+            ++pending;
+        }
+        changed.notify_all();
+    }
+
+    // Waits until no build runs or waits to run: before a device's pipelines are destroyed.
+    void WaitIdle() {
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [&] { return pending == 0; });
+    }
+
+private:
+    void loop(std::stop_token token) {
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock lock(mutex);
+                if (!changed.wait(lock, token, [&] { return !jobs.empty(); })) return;
+                job = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            job();
+            {
+                std::lock_guard lock(mutex);
+                --pending;
+            }
+            changed.notify_all();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable_any changed;
+    std::deque<std::function<void()>> jobs;
+    std::size_t pending = 0;
+    std::vector<std::jthread> threads;
+};
+
+// Never destroyed, like the store: a build may outlive the statics' destruction at exit.
+PipelineBuilders& Builders() {
+    static auto* builders = new PipelineBuilders();
+    return *builders;
+}
 
 // Never destroyed: the pipelines belong to a device that may already be gone when statics die, and
 // the device's teardown (ClearCachedPipelines) is the place to destroy them.
@@ -696,7 +758,7 @@ bool alive(const PipelineStore::Entry& entry, const Context& context) {
 // Drops an entry of a device that is gone: its objects went with the device, so they are forgotten,
 // not destroyed.
 std::list<PipelineStore::Entry>::iterator abandon(PipelineStore& store, std::list<PipelineStore::Entry>::iterator it) {
-    it->pipeline->Abandon();
+    if (it->pipeline != nullptr) it->pipeline->Abandon();
     store.index.erase(it->hash);
     return store.entries.erase(it);
 }
@@ -708,17 +770,25 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
-    store.hits = store.misses = store.uncached = store.evicted = 0;
+    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %llu deferred, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), static_cast<unsigned long long>(store.deferred), store.entries.size());
+    store.hits = store.misses = store.uncached = store.evicted = store.deferred = 0;
 }
 
 }
 
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+bool AsyncPipelines() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_ASYNC_PIPELINES");
+        return text != nullptr && text[0] != '\0' && text[0] != '0';
+    }();
+    return enabled;
+}
+
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, const std::shared_ptr<const ShaderResources>* defer) {
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
-    std::lock_guard lock(store.mutex);
+    std::unique_lock lock(store.mutex);
     reportPipelines(store);
     auto& key = store.scratchKey;
     pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
@@ -727,28 +797,86 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     }
     const auto hash = hashKey(key);
-    if (const auto found = store.index.find(hash); found != store.index.end()) {
+    for (;;) {
+        const auto found = store.index.find(hash);
+        if (found == store.index.end()) break;
         const auto it = found->second;
-        if (it->key == key) {
-            // The key names the device handle, which the loader may reuse for a device created after
-            // this one was destroyed without ClearCachedPipelines: such an entry is a miss.
-            if (alive(*it, context)) {
-                ++store.hits;
-                store.entries.splice(store.entries.end(), store.entries, it);
-                return it->pipeline;
-            }
-            abandon(store, it);
-        } else {
+        if (it->key != key) {
             // A different configuration with the same hash keeps the resident entry; this one stays private.
             ++store.uncached;
             return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
         }
+        // The key names the device handle, which the loader may reuse for a device created after
+        // this one was destroyed without ClearCachedPipelines: such an entry is a miss.
+        if (!alive(*it, context)) {
+            abandon(store, it);
+            break;
+        }
+        if (it->pipeline == nullptr) {
+            // Built in the background: a deferring caller skips its draw, another waits for it (the
+            // wait releases the store, and the entry is looked up afresh after it).
+            if (defer != nullptr) {
+                ++store.deferred;
+                return nullptr;
+            }
+            store.built.wait(lock);
+            continue;
+        }
+        ++store.hits;
+        store.entries.splice(store.entries.end(), store.entries, it);
+        return it->pipeline;
     }
     ++store.misses;
     // Entries of another device belong to one the driver replaced (it does so under the GpuMutex
     // before any draw reaches the new device), whose objects went with it: forget them.
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
+    }
+    if (defer != nullptr) {
+        // The build runs from copies: the draw's shaders and state are gone by the time it ends.
+        struct Job {
+            Context context;
+            State state;
+            VertexInputLayout vertexInput;
+            std::shared_ptr<const ShaderResources> resources;
+            std::vector<ShaderRecompiler::RecompileResult> programs;
+            std::vector<CompiledShader> shaders;
+            VkImageLayout attachmentLayout;
+            std::uint64_t hash;
+            std::vector<std::byte> key;
+        };
+        auto job = std::make_shared<Job>(Job{context, state, vertexInput, *defer, {}, {}, attachmentLayout, hash, key});
+        job->programs.reserve(shaders.size());
+        for (const auto& shader : shaders) {
+            job->programs.push_back(*shader.program);
+            job->shaders.push_back({shader.stage, &job->programs.back(), shader.pushConstantOffset});
+        }
+        store.entries.push_back({context.device, context.bufferPool, hash, key, nullptr});
+        store.index[hash] = std::prev(store.entries.end());
+        ++store.deferred;
+        Builders().Run([job] {
+            std::shared_ptr<Pipeline> pipeline;
+            try {
+                pipeline = std::make_shared<Pipeline>(job->context, job->state, job->vertexInput, *job->resources, job->shaders, job->attachmentLayout);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[pipecache] background build failed (%s); its draw builds it again\n", error.what());
+            }
+            auto& store = Pipelines();
+            {
+                std::lock_guard lock(store.mutex);
+                // The entry is gone when its device was torn down meanwhile: the pipeline goes too.
+                if (const auto found = store.index.find(job->hash); found != store.index.end() && found->second->key == job->key && found->second->pipeline == nullptr) {
+                    if (pipeline != nullptr) {
+                        found->second->pipeline = std::move(pipeline);
+                    } else {
+                        store.entries.erase(found->second);
+                        store.index.erase(found);
+                    }
+                }
+            }
+            store.built.notify_all();
+        });
+        return nullptr;
     }
     auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
@@ -766,6 +894,8 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 }
 
 void ClearCachedPipelines(VkDevice device) {
+    // Background builds use the device: they end before its pipelines go.
+    Builders().WaitIdle();
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     for (auto it = store.entries.begin(); it != store.entries.end();) {

@@ -69,7 +69,7 @@ std::span<const VkDynamicState> PipelineLibraryDynamicStates() {
 VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys) {
     Require(info.renderPass == VK_NULL_HANDLE && info.pDynamicState != nullptr, "pipeline library parts need dynamic rendering and the library dynamic states");
     auto& store = Libraries();
-    std::lock_guard lock(store.mutex);
+    std::unique_lock lock(store.mutex);
     auto& device = store.devices[context.device];
     if (device.destroyPipeline == nullptr) {
         device.destroyPipeline = context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline");
@@ -144,7 +144,21 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             break;
         }
         VkPipeline handle = VK_NULL_HANDLE;
-        Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle), "vkCreateGraphicsPipelines library");
+        {
+            // The driver's compile of a shader part takes up to a few hundred milliseconds: other
+            // threads' links (whose parts are built) and builds go on meanwhile. The device entry and
+            // its maps stay: only the device's teardown erases them, after every build ended.
+            lock.unlock();
+            const auto result = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
+            lock.lock();
+            Check(result, "vkCreateGraphicsPipelines library");
+        }
+        if (const auto raced = cache.find(key); raced != cache.end()) {
+            // Another thread built the same part meanwhile: its handle is the cached one.
+            device.destroyPipeline(context.device, handle, nullptr);
+            libraries.push_back(raced->second);
+            continue;
+        }
         cache.emplace(key, handle);
         ++device.counters.built[part];
         libraries.push_back(handle);

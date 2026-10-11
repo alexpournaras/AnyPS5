@@ -2006,7 +2006,29 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         masked->blends.at(state.colors[index].exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
     }
     const State& pipelineState = masked.has_value() ? *masked : state;
-    auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    // APS5_ASYNC_PIPELINES: a recorded draw that leaves nothing behind but its targets' pixels (no
+    // completion work, no store to guest memory) is skipped while its pipeline is built in the
+    // background; a skipped store could feed later work wrong data, so such draws wait for it.
+    const auto writesMemory = [&] {
+        for (const auto& shader : shaders) {
+            for (const auto& binding : shader.program->bindings) {
+                if (binding.role == ShaderRecompiler::DescriptorRole::Gds) return true;
+                if (binding.role == ShaderRecompiler::DescriptorRole::GuestImages && binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
+                    if (binding.imageWritten.size() < binding.count || std::find(binding.imageWritten.begin(), binding.imageWritten.end(), true) != binding.imageWritten.end()) return true;
+                }
+                if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+                    if (binding.bufferWritten.size() < binding.count || std::find(binding.bufferWritten.begin(), binding.bufferWritten.end(), true) != binding.bufferWritten.end()) return true;
+                }
+            }
+        }
+        return false;
+    };
+    const std::shared_ptr<const ShaderResources> deferOwner = AsyncPipelines() && lean && !completion && !listed && !outcome.waited && !writesMemory() ? resources : nullptr;
+    auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, deferOwner != nullptr ? &deferOwner : nullptr);
+    if (pipeline == nullptr) {
+        report(" skipped while its pipeline is built");
+        return;
+    }
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;
