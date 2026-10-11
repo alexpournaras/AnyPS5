@@ -1028,9 +1028,18 @@ std::string NullPixelProgramRejection(const QueueState& queue) {
     return {};
 }
 
-std::vector<RegisterRead>*& RegisterReadLog() {
-    static thread_local std::vector<RegisterRead>* log = nullptr;
-    return log;
+namespace {
+thread_local std::vector<RegisterRead>* registerReadLog = nullptr;
+}
+
+std::vector<RegisterRead>* RegisterReadLog() {
+    return registerReadLog;
+}
+
+void SetRegisterReadLog(std::vector<RegisterRead>* log) {
+    if (registerReadLog == nullptr && log != nullptr) registerReadLogs.fetch_add(1, std::memory_order_relaxed);
+    if (registerReadLog != nullptr && log == nullptr) registerReadLogs.fetch_sub(1, std::memory_order_relaxed);
+    registerReadLog = log;
 }
 
 bool DrawKeyCovers(RegisterRead read) {

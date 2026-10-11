@@ -125,8 +125,8 @@ void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submis
     if (decode == nullptr || verifyDrawRecipe()) {
         std::vector<Graphics::RegisterRead> readLog;
         struct LogScope {
-            explicit LogScope(std::vector<Graphics::RegisterRead>* log) { Graphics::RegisterReadLog() = log; }
-            ~LogScope() { Graphics::RegisterReadLog() = nullptr; }
+            explicit LogScope(std::vector<Graphics::RegisterRead>* log) { Graphics::SetRegisterReadLog(log); }
+            ~LogScope() { Graphics::SetRegisterReadLog(nullptr); }
         } logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);
         auto fresh = decodeDraw(queue, submission);
         if (verifyDrawRecipe() && registerKey) {

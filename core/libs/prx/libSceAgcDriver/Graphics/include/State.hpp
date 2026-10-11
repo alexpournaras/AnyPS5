@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <vector>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -141,8 +142,14 @@ struct RegisterRead {
     RegisterBank bank;
     std::uint32_t offset;
 };
-std::vector<RegisterRead>*& RegisterReadLog();
+// The calling thread's log (null when unset). SetRegisterReadLog counts the threads with one set,
+// so NoteRegisterRead returns before the thread-local lookup (an emutls call under MinGW, a
+// measurable share of the draw path) while none is.
+std::vector<RegisterRead>* RegisterReadLog();
+void SetRegisterReadLog(std::vector<RegisterRead>* log);
+inline std::atomic<std::uint32_t> registerReadLogs{0};
 inline void NoteRegisterRead(RegisterBank bank, std::uint32_t offset) {
+    if (registerReadLogs.load(std::memory_order_relaxed) == 0) return;
     if (auto* log = RegisterReadLog()) log->push_back({bank, offset});
 }
 inline const char* RegisterBankName(RegisterBank bank) {
