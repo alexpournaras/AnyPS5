@@ -5,7 +5,9 @@
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "Decoder/Png.hpp"
 #include "SDL_vulkan.h"
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -106,21 +108,29 @@ void DisplayWindow::DrawableSize(std::uint32_t& width, std::uint32_t& height) co
 void DisplayWindow::UpdateTitle() {
     require(window != nullptr, "window must exist before updating title");
     static const AppTitle title = GetAppTitle_nid_postfix();
-    static std::uint64_t fpsStart = sceKernelGetProcessTimeCounter();
+    // Host wall-clock time: the guest's process time counter runs APS5_TIME_SCALE times faster, which
+    // would divide the shown rate by the scale.
+    static const double timeScale = [] {
+        const char* value = std::getenv("APS5_TIME_SCALE");
+        const double parsed = value ? std::strtod(value, nullptr) : 1.0;
+        return parsed > 0.0 ? parsed : 1.0;
+    }();
+    static auto fpsStart = std::chrono::steady_clock::now();
     static std::uint64_t frameNum = 0;
     static std::uint64_t fpsFrames = 0;
     static double currentFps = 0.0;
-    const auto now = sceKernelGetProcessTimeCounter();
-    const auto frequency = sceKernelGetProcessTimeCounterFrequency();
+    const auto now = std::chrono::steady_clock::now();
     frameNum++;
     fpsFrames++;
-    if (now - fpsStart >= frequency * 2) {
-        currentFps = static_cast<double>(fpsFrames) * static_cast<double>(frequency) / static_cast<double>(now - fpsStart);
+    const double elapsed = std::chrono::duration<double>(now - fpsStart).count();
+    if (elapsed >= 2.0) {
+        currentFps = static_cast<double>(fpsFrames) / elapsed;
         fpsStart = now;
         fpsFrames = 0;
     }
-    char text[160];
-    std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu)", title.value, currentFps, static_cast<unsigned long long>(frameNum));
+    char text[192];
+    if (timeScale != 1.0) std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu) | game time x%g", title.value, currentFps, static_cast<unsigned long long>(frameNum), timeScale);
+    else std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu)", title.value, currentFps, static_cast<unsigned long long>(frameNum));
     SDL_SetWindowTitle(window, text);
 }
 
