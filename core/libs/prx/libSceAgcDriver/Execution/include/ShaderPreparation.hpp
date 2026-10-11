@@ -17,6 +17,12 @@ public:
     PreparedShaderState& Edit(const ShaderSnapshot& snapshot);
     const PreparedShaderState& Read(const ShaderSnapshot& snapshot) const;
     void Commit();
+    // Gives up the writers' lock for a long preparation when the transaction (its outermost one)
+    // has edited nothing yet: what it read is dropped, so its next Read or Edit sees what other
+    // threads committed meanwhile, and references from earlier Reads must not be used after it.
+    // Returns false (and keeps the lock) when an edit is pending. Resume takes the lock back.
+    bool Suspend();
+    void Resume();
 
 private:
     struct State;

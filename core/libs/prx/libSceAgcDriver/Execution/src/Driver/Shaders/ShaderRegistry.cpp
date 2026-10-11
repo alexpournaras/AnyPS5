@@ -166,6 +166,19 @@ const PreparedShaderState& ShaderPreparationTransaction::Read(const ShaderSnapsh
     return changes.emplace(snapshot.prepared.get(), State::Change{snapshot.prepared, *snapshot.prepared, false, snapshot.prepared->entries.size(), snapshot.prepared->registeredAbis.size()}).first->second.prepared;
 }
 
+bool ShaderPreparationTransaction::Suspend() {
+    require(!committed, "shader preparation transaction is already committed");
+    if (!root->lock.owns_lock()) return false;
+    if (std::ranges::any_of(root->changes, [](const auto& change) { return change.second.edited; })) return false;
+    root->changes.clear();
+    root->lock.unlock();
+    return true;
+}
+
+void ShaderPreparationTransaction::Resume() {
+    root->lock.lock();
+}
+
 void ShaderPreparationTransaction::Commit() {
     require(!committed && !root->failed, "shader preparation transaction was aborted");
     if (state != nullptr) {
@@ -226,6 +239,21 @@ void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const st
 }
 
 namespace {
+
+// Runs `work` (a shader preparation, up to hundreds of milliseconds) with the writers' lock given
+// up when `transaction` allows it (see Suspend), so game threads that register or link other
+// shaders meanwhile are not held up behind it.
+template<typename TWork>
+auto Unlocked(ShaderPreparationTransaction& transaction, TWork&& work) {
+    struct Resume {
+        ShaderPreparationTransaction& transaction;
+        bool suspended;
+        ~Resume() {
+            if (suspended) transaction.Resume();
+        }
+    } resume{transaction, transaction.Suspend()};
+    return work();
+}
 
 bool PreparedAtUse(const ShaderSnapshot& snapshot, const ShaderRecompiler::RecompileRequest& request) {
     // Registration prepares the null pixel program for one pixel state; a depth-only draw may need it in another
@@ -656,7 +684,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         }
         if (handle == nullptr) {
             PerformanceTimer timing("Shader.PrepareArtifact");
-            handle = PrepareShaderWithDiagnostics(request);
+            handle = Unlocked(transaction, [&] { return PrepareShaderWithDiagnostics(request); });
         }
         const auto bytes = handle->artifact->bindings.pushConstantSizeBytes;
         require(bytes <= room, "prepared graphics stages exceed the push constant block");
@@ -769,7 +797,12 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         transaction.Commit();
         return;
     }
-    auto entries = PrepareRegistered(*snapshot, *localDevice, state, false);
+    auto entries = Unlocked(transaction, [&] { return PrepareRegistered(*snapshot, *localDevice, state, false); });
+    // Another thread may have resolved the same ABI while the lock was given up.
+    if (std::ranges::find(transaction.Read(*snapshot).registeredAbis, key) != transaction.Read(*snapshot).registeredAbis.end()) {
+        transaction.Commit();
+        return;
+    }
     auto& prepared = transaction.Edit(*snapshot);
     for (auto& entry : entries) {
         const auto duplicate = std::ranges::any_of(prepared.entries, [&](const auto& existing) { return existing.handle->artifact == entry.handle->artifact; });
