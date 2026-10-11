@@ -222,6 +222,7 @@ public:
         *count = 0;
         const auto end = address + bytes;
         if (clear && !collectable(address, end)) return false;
+        auto hint = views.lower_bound(address & ~(pageBytes - 1));
         for (auto cursor = address; cursor < end;) {
             const auto nextClean = cleanRanges.upper_bound(cursor);
             if (nextClean != cleanRanges.begin()) {
@@ -232,9 +233,8 @@ public:
                 }
             }
             const auto base = cursor & ~(pageBytes - 1);
-            const auto found = views.find(base);
-            if (found != views.end()) {
-                auto& view = found->second;
+            if (auto* found = viewAt(base, hint)) {
+                auto& view = *found;
                 const auto stop = std::min(end, base + pageBytes);
                 if (view.protection == PAGE_NOACCESS) return false;
                 const bool pinned = view.page->pins != 0;
@@ -277,10 +277,11 @@ public:
 
 private:
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
+        auto hint = views.lower_bound(address & ~(pageBytes - 1));
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
-            if (const auto found = views.find(base); found != views.end()) {
-                if (found->second.protection == PAGE_NOACCESS) return false;
+            if (const auto* found = viewAt(base, hint)) {
+                if (found->protection == PAGE_NOACCESS) return false;
                 cursor = std::min(end, base + pageBytes);
                 continue;
             }
@@ -427,6 +428,21 @@ private:
 
     std::map<std::uintptr_t, std::uintptr_t> cleanRanges;
     std::map<std::uintptr_t, View> views;
+
+    // The view of the page at `base` (null: none), for loops that visit pages in increasing
+    // order: `hint` (from views.lower_bound of the first page) is stepped forward instead of
+    // searching the whole map per page, and searched again only after a jump of several views.
+    View* viewAt(std::uintptr_t base, std::map<std::uintptr_t, View>::iterator& hint) {
+        for (int step = 0; hint != views.end() && hint->first < base; ++step) {
+            if (step == 2) {
+                hint = views.lower_bound(base);
+                break;
+            }
+            ++hint;
+        }
+        return hint != views.end() && hint->first == base ? &hint->second : nullptr;
+    }
+
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::mutex mutex;
     AllocateFunction allocate = nullptr;
