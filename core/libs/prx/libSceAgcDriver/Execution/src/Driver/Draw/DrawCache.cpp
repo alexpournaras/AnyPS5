@@ -40,7 +40,9 @@ std::size_t Driver::drawCacheEntries() {
     static const std::size_t entries = [] {
         const char* text = std::getenv("APS5_DRAW_CACHE_ENTRIES");
         const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
-        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{4096};
+        // A busy scene issues ~10,000 draws a frame (Call of Duty: Black Ops, outdoors): 4,096 entries were
+        // evicted before the next frame reused them (39% hits there, 67% with 32,768).
+        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{32768};
     }();
     return entries;
 }
