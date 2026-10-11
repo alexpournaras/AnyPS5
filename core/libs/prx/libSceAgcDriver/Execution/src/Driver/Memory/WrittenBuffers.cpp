@@ -40,6 +40,25 @@ void Driver::noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint
     while (writtenBuffers.size() > WrittenBufferRing) writtenBuffers.pop_front();
 }
 
+bool Driver::drawWritesMemory(std::span<const Graphics::CompiledShader> stages) {
+    for (const auto& stage : stages) {
+        for (const auto& binding : stage.program->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::Gds) return true;
+            if (binding.role == ShaderRecompiler::DescriptorRole::GuestImages && binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
+                // An element beyond imageWritten is not proved read-only.
+                if (binding.imageWritten.size() < binding.count) return true;
+                for (const bool written : binding.imageWritten) {
+                    if (written) return true;
+                }
+            }
+        }
+        bool writes = false;
+        forEachWrittenBuffer(*stage.program, [&](std::uint32_t, std::uint64_t, std::uint64_t, bool) { writes = true; });
+        if (writes) return true;
+    }
+    return false;
+}
+
 void Driver::noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue) {
     for (const auto& stage : stages) {
         forEachWrittenBuffer(*stage.program, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { noteForeignWriter(begin, end, queue); });

@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
@@ -185,6 +186,9 @@ private:
     static void appendWrittenRanges(const ShaderRecompiler::RecompileResult& compiled, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
     void noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint32_t queue);
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
+    // Whether a stage stores to a guest buffer or image (or uses GDS): such a draw is recorded on
+    // the worker, since what it writes may be read by the preparation of the packets after it.
+    static bool drawWritesMemory(std::span<const Graphics::CompiledShader> stages);
     std::optional<WrittenBuffer> newestWriterLocked(std::uint64_t begin, std::uint64_t end) const;
     std::optional<WrittenBuffer> newestWriter(std::uint64_t begin, std::uint64_t end);
     std::string describeWriters(std::uint64_t begin, std::uint64_t end);
@@ -361,6 +365,11 @@ private:
 
     std::mutex validateMutex;
     ValidateCounters validateCounters;
+
+    // A submit or reap flushBetweenPackets queued behind the pipelined draws has not run yet.
+    std::atomic<bool> pipelinedFlushQueued{false};
+    // Last, so it is destroyed (its recording thread joined) before the state its tasks use.
+    DrawPipeline drawPipeline;
 
 };
 

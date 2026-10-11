@@ -1581,7 +1581,20 @@ void GpuMutexType::acquired() {
     ++depth;
 }
 
+namespace {
+std::atomic<void (*)()> gpuLockHook{nullptr};
+
+void beforeOutermostHold(const GpuMutexType& mutex) {
+    if (auto* hook = gpuLockHook.load(std::memory_order_acquire); hook != nullptr && !mutex.HeldByThisThread()) hook();
+}
+}
+
+void SetGpuLockHook(void (*hook)()) {
+    gpuLockHook.store(hook, std::memory_order_release);
+}
+
 bool GpuMutexType::try_lock() {
+    beforeOutermostHold(*this);
     if (!GpuLockProfiled()) {
         if (!mutex.try_lock()) return false;
         acquired();
@@ -1641,6 +1654,7 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    beforeOutermostHold(*this);
     if (!GpuLockProfiled()) {
         mutex.lock();
         acquired();

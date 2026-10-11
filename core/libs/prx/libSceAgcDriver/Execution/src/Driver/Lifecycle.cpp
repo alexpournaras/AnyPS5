@@ -40,6 +40,8 @@ void Driver::stop() {
     for (auto& [queue, worker] : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
+    drawPipeline.Stop();
+    DrawPipeline::Activate(nullptr);
     StopWorkerSampler();
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     device.Reset();
@@ -51,6 +53,7 @@ void Driver::stop() {
 
 Driver::Driver() {
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
+    if (DrawPipeline::Enabled()) DrawPipeline::Activate(&drawPipeline);
     try {
         LibcRegisterShutdown_nid_postfix([] { Driver::Get().Shutdown(); });
     } catch (...) {

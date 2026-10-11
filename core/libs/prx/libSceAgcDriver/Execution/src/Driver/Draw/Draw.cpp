@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -141,7 +142,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
         phaseTiming.Phase(DrawRowDecode);
     }
-    ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    // On the heap: the snapshots point into its pages, and a pipelined draw takes it along.
+    auto shaderMemoryOwner = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    auto& shaderMemory = *shaderMemoryOwner;
     std::vector<ShaderRecompiler::RecompileResult> results;
     std::vector<Graphics::CompiledShader> stages;
     results.reserve(programs.size() + 2u);
@@ -363,6 +366,53 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             rejected = std::move(*known);
             return DrawVerdict::Rejected;
         }
+    }
+    // APS5_DRAW_PIPELINE: the recording thread records the draw (see DrawPipeline), unless labels
+    // wait to be recorded before it or it writes memory a later packet's preparation may read. The
+    // locals the stages and snapshots point into move with it (a moved vector keeps its elements).
+    if (submission.queue == 0 && DrawPipeline::Enabled() && !profile && !gpuLock.owns_lock() && deferredLabels().labels.empty() && !drawWritesMemory(stages)) {
+        struct Handed {
+            std::shared_ptr<VulkanDevice> device;
+            std::shared_ptr<const DrawDecode> decode;
+            std::shared_ptr<DrawEntry> entry;
+            std::shared_ptr<ShaderMemory> shaderMemory;
+            std::vector<DrawProgram> programs;
+            std::vector<ShaderRecompiler::MemoryRegion> memory;
+            std::vector<ShaderRecompiler::LinkedProgram> linked;
+            std::vector<ShaderRecompiler::RecompileResult> results;
+            std::vector<Graphics::CompiledShader> stages;
+            std::vector<Graphics::GuestMemorySnapshot> snapshots;
+            std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
+            std::vector<StageCapture> stageCaptures;
+            std::vector<std::shared_ptr<DispatchVariant>> matched, fresh, recipeStages;
+            std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions;
+            std::shared_ptr<const DrawRecipe> recipe;
+            Pm4::DrawParameters drawParameters;
+            std::uint64_t drawKey;
+        };
+        auto handed = std::make_shared<Handed>(Handed{std::move(localDevice), std::move(decode), std::move(entry), std::move(shaderMemoryOwner), std::move(programs), std::move(memory), std::move(linked), std::move(results), std::move(stages), std::move(snapshots), std::move(decodeReads), std::move(stageCaptures), std::move(matched), std::move(fresh), std::move(recipeStages), std::move(matchedRegions), std::move(recipe), drawParameters, drawKey});
+        drawPipeline.Enqueue([this, handed = std::move(handed)] {
+            try {
+                auto& work = *handed;
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+                std::lock_guard recordLock(GuestMemory::GpuMutex());
+                auto recording = device.Load();
+                if (recording == nullptr) recording = work.device;
+                recordLabelsForPacket(recording.get(), 0);
+                const auto& state = work.decode->state;
+                if (work.recipe != nullptr) {
+                    if (recording->DrawFromRecipe(state, work.drawParameters, work.stages, work.snapshots, work.recipe) == RecipeOutcome::Recorded) return;
+                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+                }
+                std::shared_ptr<const DrawRecipe> built;
+                recording->Draw(state, work.drawParameters, work.stages, work.snapshots, work.recipeStages.empty() ? nullptr : &built);
+                if (built != nullptr) attachDrawRecipe(work.drawKey, work.recipeStages, std::move(built));
+            } catch (...) {
+                ReportFailure(std::current_exception());
+            }
+        });
+        timing.Mark("draw_handed_over");
+        return drawn();
     }
     lockForDraw();
     noteDrawWriters(stages, submission.queue);

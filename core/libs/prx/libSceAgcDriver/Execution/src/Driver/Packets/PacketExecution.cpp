@@ -47,6 +47,8 @@ void Driver::execute(const Submission& submission) {
 
         static const bool suspendDrain = std::getenv("APS5_SUSPEND_DRAIN") != nullptr;
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        // Pipelined draws are recorded before the checks below see what is recorded.
+        if (drawPipeline.PendingForThisThread()) drawPipeline.Drain();
         ++suspendPoints;
         auto& costs = submissionCosts(submission.queue);
 
@@ -200,6 +202,9 @@ void Driver::execute(const Submission& submission) {
         } progress{*this, !waitPacket};
         if (!waitPacket) ++packetsInFlight;
         recent.Record(cursor);
+        // A flip presents, and a memory wait may wait for, what the pipelined draws record; the
+        // other packets that depend on them take GpuMutex, whose lock hook drains them.
+        if ((header == FlipPacketHeader || opcode == 0x3c || opcode == 0x93) && drawPipeline.PendingForThisThread()) drawPipeline.Drain();
         if (header == RenderingWaitPacketHeader) {
             timed(&WorkerProfile::waitMs, [&] { submission.renderingWaits.at(cursor)->Wait(); });
         } else if (header == FlipPacketHeader) {
@@ -318,6 +323,7 @@ void Driver::execute(const Submission& submission) {
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
+    if (drawPipeline.PendingForThisThread()) drawPipeline.Drain();
     if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {
         auto& costs = submissionCosts(submission.queue);
         if (!submitAtEnd && submission.rewindTail == nullptr && submission.queue == 0 && workerQueued() != nullptr && workerQueued()->load(std::memory_order_acquire) != 0) {

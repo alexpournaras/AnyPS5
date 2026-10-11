@@ -50,6 +50,32 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         return;
     }
     if (reap) lastReapTry = now;
+    // APS5_DRAW_PIPELINE: a submit or a reap alone goes behind the pipelined draws as a task of
+    // its own rather than waiting for them under the lock hook; recording labels still waits. While
+    // one is queued the packets after it queue no other (they see the same recorded work).
+    if (!record && drawPipeline.PendingForThisThread()) {
+        if (!pipelinedFlushQueued.exchange(true, std::memory_order_acq_rel)) {
+            drawPipeline.Enqueue([this, queue, submits = submit || capped] {
+                pipelinedFlushQueued.store(false, std::memory_order_release);
+                try {
+                    GuestMemory::TagGpuLockSite(submits ? GuestMemory::GpuLockSite::Flush : GuestMemory::GpuLockSite::Other);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    const auto localDevice = device.Load();
+                    if (localDevice == nullptr) return;
+                    if (!submits) {
+                        localDevice->ReapRecorded();
+                        ++boundaryReaps;
+                    } else if (Graphics::Recorder::PendingLabelSince().has_value() || (batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap())) {
+                        localDevice->SubmitRecorded(queue == 0);
+                        ++capFlushes;
+                    }
+                } catch (...) {
+                    ReportFailure(std::current_exception());
+                }
+            });
+        }
+        return;
+    }
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
 
     if (record) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);

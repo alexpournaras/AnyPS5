@@ -149,6 +149,11 @@ GpuMutexType& GpuMutex();
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
+// Called on a thread about to take its outermost hold, before it waits for the mutex: the draw
+// pipeline (APS5_DRAW_PIPELINE) lets the queue worker finish the draws it handed to the recording
+// thread, so nothing it records under the mutex overtakes them. One hook, set once; it must not
+// take GpuMutex itself.
+void SetGpuLockHook(void (*hook)());
 // Debug aid (APS5_ASSERT_GPU_LOCK=1): aborts with a [lock] line naming `where` when the calling
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).
