@@ -115,6 +115,17 @@ const uint8_t* APS5_VABI sceCesRefersUcsProfileCp1251(void) {
     return CP1251_PROFILE;
 }
 
+const void* APS5_VABI sceCesRefersUcsProfileCp1250(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return nullptr;
+}
+
+const void* APS5_VABI sceCesUcsProfileInitSJis1997Cp932(void* buffer) {
+    (void)buffer;
+    NotImplemented_nid_no_patch(__func__);
+    return nullptr;
+}
+
 int APS5_VABI sceCesMbcsUcsContextInit(void* context, const void* profile) {
     (void)profile;
     if (!context) return CES_ERROR_INVALID_PARAMETER;

@@ -24,6 +24,9 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
         return DrawVerdict::Drawn;
     }
     if (Graphics::DepthResummarizeDrawsNothing(queue)) return DrawVerdict::Nothing;
+    if (const auto control = queue.context.find(0x000); control != queue.context.end() && (control->second & 0xcu) != 0 && (control->second & ~0xfacu) == 0) {
+        return DrawVerdict::Nothing;
+    }
     rejected = Graphics::DepthMaintenanceRejection(queue);
     if (!rejected.empty()) return DrawVerdict::Rejected;
     static const bool traceIndirectEnabled = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;

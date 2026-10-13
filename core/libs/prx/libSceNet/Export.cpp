@@ -83,10 +83,16 @@ constexpr int NET_SOL_SOCKET = 0xFFFF;
 constexpr int NET_SO_SNDTIMEO = 0x1005;
 constexpr int NET_SO_RCVTIMEO = 0x1006;
 constexpr int NET_SO_NBIO = 0x1200;
-constexpr int NET_SO_REUSEADDR = 0x4;
-constexpr int NET_SO_BROADCAST = 0x20;
+constexpr int NET_SO_REUSEADDR = 0x0004;
+constexpr int NET_SO_KEEPALIVE = 0x0008;
+constexpr int NET_SO_BROADCAST = 0x0020;
+constexpr int NET_SO_REUSEPORT = 0x0200;
+constexpr int NET_SO_ONESBCAST = 0x10000;
 constexpr int NET_SO_SNDBUF = 0x1001;
 constexpr int NET_SO_RCVBUF = 0x1002;
+constexpr int NET_SO_ERROR = 0x1007;
+constexpr int NET_SO_TYPE = 0x1008;
+constexpr int NET_SO_SYSTEM_1105 = 0x1105;
 constexpr int NET_MSG_PEEK = 0x2;
 constexpr int NET_MSG_TRUNC = 0x10;
 constexpr int NET_UIO_MAXIOV = 1024;
@@ -958,10 +964,11 @@ int APS5_VABI sceNetSetsockopt(int s, int level, int optname, const void* optval
     } else if (optname == NET_SO_RCVTIMEO || optname == NET_SO_SNDTIMEO) {
         if (value < 0) return fail(NET_EINVAL);
         if (set_native_timeout(socket.native->value, optname, value) != 0) return fail(native_error());
-    } else if (optname == NET_SO_REUSEADDR || optname == NET_SO_BROADCAST || optname == NET_SO_SNDBUF || optname == NET_SO_RCVBUF) {
-        const int native_option = optname == NET_SO_REUSEADDR ? SO_REUSEADDR : optname == NET_SO_BROADCAST ? SO_BROADCAST : optname == NET_SO_SNDBUF ? SO_SNDBUF : SO_RCVBUF;
+    } else if (optname == NET_SO_SNDBUF || optname == NET_SO_RCVBUF || optname == NET_SO_REUSEADDR || optname == NET_SO_BROADCAST || optname == NET_SO_KEEPALIVE) {
+        const int native_option = optname == NET_SO_SNDBUF ? SO_SNDBUF : optname == NET_SO_RCVBUF ? SO_RCVBUF : optname == NET_SO_REUSEADDR ? SO_REUSEADDR : optname == NET_SO_BROADCAST ? SO_BROADCAST : SO_KEEPALIVE;
         if (::setsockopt(socket.native->value, SOL_SOCKET, native_option, reinterpret_cast<const char*>(&value), sizeof(value)) != 0)
             return fail(native_error());
+    } else if (optname == NET_SO_ONESBCAST || optname == NET_SO_REUSEPORT || optname == NET_SO_SYSTEM_1105) {
     } else {
         return fail(NET_EOPNOTSUPP);
     }
@@ -992,6 +999,23 @@ int APS5_VABI sceNetGetsockopt(int s, int level, int optname, void* optval, uint
         case NET_SO_NBIO: value = socket.nonblock ? 1 : 0; break;
         case NET_SO_RCVTIMEO: value = socket.rcv_timeout_us; break;
         case NET_SO_SNDTIMEO: value = socket.snd_timeout_us; break;
+        case NET_SO_SNDBUF:
+        case NET_SO_RCVBUF:
+        case NET_SO_ERROR:
+        case NET_SO_TYPE: {
+            const int native_option = optname == NET_SO_SNDBUF ? SO_SNDBUF : optname == NET_SO_RCVBUF ? SO_RCVBUF : optname == NET_SO_ERROR ? SO_ERROR : SO_TYPE;
+            NativeLength native_length = sizeof(value);
+            if (::getsockopt(socket.native->value, SOL_SOCKET, native_option, reinterpret_cast<char*>(&value), &native_length) != 0) return fail(native_error());
+            if (optname == NET_SO_ERROR && value != 0) {
+#ifdef _WIN32
+                WSASetLastError(value);
+#else
+                errno = value;
+#endif
+                value = native_error();
+            }
+            break;
+        }
         default: return fail(NET_EOPNOTSUPP);
     }
     std::memcpy(optval, &value, sizeof(value));
