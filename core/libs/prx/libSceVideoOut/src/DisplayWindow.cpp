@@ -5,6 +5,7 @@
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "Decoder/Png.hpp"
 #include "SDL_vulkan.h"
+#include <chrono>
 #include <cstdio>
 #include <span>
 #include <stdexcept>
@@ -106,16 +107,16 @@ void DisplayWindow::DrawableSize(std::uint32_t& width, std::uint32_t& height) co
 void DisplayWindow::UpdateTitle() {
     require(window != nullptr, "window must exist before updating title");
     static const AppTitle title = GetAppTitle_nid_postfix();
-    static std::uint64_t fpsStart = sceKernelGetProcessTimeCounter();
+    static auto fpsStart = std::chrono::steady_clock::now();
     static std::uint64_t frameNum = 0;
     static std::uint64_t fpsFrames = 0;
     static double currentFps = 0.0;
-    const auto now = sceKernelGetProcessTimeCounter();
-    const auto frequency = sceKernelGetProcessTimeCounterFrequency();
+    const auto now = std::chrono::steady_clock::now();
     frameNum++;
     fpsFrames++;
-    if (now - fpsStart >= frequency * 2) {
-        currentFps = static_cast<double>(fpsFrames) * static_cast<double>(frequency) / static_cast<double>(now - fpsStart);
+    const double elapsed = std::chrono::duration<double>(now - fpsStart).count();
+    if (elapsed >= 2.0) {
+        currentFps = static_cast<double>(fpsFrames) / elapsed;
         fpsStart = now;
         fpsFrames = 0;
     }
