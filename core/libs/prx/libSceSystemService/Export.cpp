@@ -115,9 +115,7 @@ HostLaunch PrepareLaunch(const char* path, const char* const* arguments) {
         launch.executable = mainLength > 0 && mainLength < main.size() ? main.substr(0, mainLength) : own;
     } else {
         const auto target = ownPath.parent_path() / (Utf16(ConvertedExecutableName(path)) + ownPath.extension().wstring());
-        if (!std::filesystem::is_regular_file(target)) {
-            UnconvertedExecutable(std::string(path) + " without its converted executable; relink with --executable " + (path + std::size(ApplicationRoot) - 1));
-        }
+        if (!std::filesystem::is_regular_file(target)) return launch;
         launch.executable = target.wstring();
     }
     if (GetEnvironmentVariableW(MainExecutableVariableWide, nullptr, 0) == 0 && !SetEnvironmentVariableW(MainExecutableVariableWide, own.c_str())) {
@@ -194,6 +192,9 @@ int APS5_VABI sceSystemServiceLoadExec(const char* path, const char* const* argu
     if (!path || !*path) return SYSTEM_SERVICE_ERROR_PARAMETER;
     if (std::strcmp(path, "exit") == 0) LibcExit_nid_no_patch(0);
     auto launch = PrepareLaunch(path, arguments);
+#if defined(_WIN32)
+    if (launch.executable.empty()) return SYSTEM_SERVICE_ERROR_PARAMETER;
+#endif
     LibcRunShutdown_nid_postfix();
     std::fflush(nullptr);
     StartHostExecutable(launch);
