@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
+#include <string_view>
 
 namespace AgcDriver::DriverDetail {
 
@@ -34,6 +35,14 @@ bool Driver::drawDataHits() {
 bool Driver::drawStageDataHits() {
     static const bool hits = std::getenv("APS5_NO_DRAW_STAGE_DATA_HITS") == nullptr && !stampValidate();
     return hits;
+}
+
+bool Driver::drawShared() {
+    static const bool shared = [] {
+        const char* value = std::getenv("APS5_DRAW_SHARED");
+        return !(value != nullptr && std::string_view(value) == "0");
+    }() && drawDataHits();
+    return shared;
 }
 
 bool Driver::verifyDrawDataHits() {

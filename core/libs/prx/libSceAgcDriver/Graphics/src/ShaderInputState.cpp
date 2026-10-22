@@ -10,7 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <span>
 #include <string>
+#include <string_view>
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -198,7 +200,7 @@ bool PixelEarlyZ(std::uint32_t shaderControl) {
     return depthBeforeShader || ((zOrder & 1u) != 0u && !pixelKillEnable && !depthExportEnable && !sampleMaskExportEnable && !stencilRefExportEnable);
 }
 
-ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const std::byte> header, std::uint64_t headerAddress, std::span<const std::uint32_t> userData, std::vector<DecodeRead>* reads, bool staticAbi, std::uint32_t hiddenUserWords) {
+static ShaderRecompiler::ShaderVertexStageInfo decodeVertexStageInfoWith(std::span<const std::byte> header, std::uint64_t headerAddress, std::span<const std::uint32_t> userData, std::vector<DecodeRead>* reads, bool staticAbi, std::uint32_t hiddenUserWords, bool batched) {
     if (header.empty()) return {};
     if (header.size() < sizeof(Shader)) throw std::runtime_error("AGC graphics: shader header is smaller than the fixed AGC header");
     Shader shader;
@@ -244,6 +246,31 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         read.size = static_cast<std::uint32_t>(bytes.size());
     };
     if (reads != nullptr) reads->reserve(reads->size() + 2u * shader.num_input_semantics);
+    constexpr std::uint64_t BatchAttribWords = 64;
+    std::array<std::uint32_t, BatchAttribWords> attribBlock{};
+    std::array<std::array<std::uint32_t, 4>, ShaderRecompiler::ShaderVertexStageInfo::MaxResources> sharpBlock{};
+    std::uint64_t attribFirst = 0, attribCount = 0, sharpFirst = 0, sharpCount = 0;
+    if (batched && !staticAbi) {
+        std::uint64_t low = ~std::uint64_t{0}, high = 0;
+        for (std::uint32_t i = 0; i < shader.num_input_semantics; ++i) {
+            low = std::min<std::uint64_t>(low, semantics[i].semantic);
+            high = std::max<std::uint64_t>(high, semantics[i].semantic);
+        }
+        if (high - low < BatchAttribWords) {
+            attribFirst = low;
+            attribCount = high - low + 1u;
+            AgcDriver::GuestMemory::Read(attribTableAddr + attribFirst * 4u, std::as_writable_bytes(std::span(attribBlock.data(), static_cast<std::size_t>(attribCount))), 4);
+            std::uint64_t lowIndex = ~std::uint64_t{0}, highIndex = 0;
+            for (std::uint32_t i = 0; i < shader.num_input_semantics; ++i) {
+                const auto index = static_cast<std::uint64_t>(attribBlock[semantics[i].semantic - attribFirst] & 0x1fu);
+                lowIndex = std::min(lowIndex, index);
+                highIndex = std::max(highIndex, index);
+            }
+            sharpFirst = lowIndex;
+            sharpCount = highIndex - lowIndex + 1u;
+            AgcDriver::GuestMemory::Read(bufferTableAddr + sharpFirst * 16u, std::as_writable_bytes(std::span(sharpBlock.data(), static_cast<std::size_t>(sharpCount))), 4);
+        }
+    }
     for (std::uint32_t i = 0; i < shader.num_input_semantics; ++i) {
         const auto& semantic = semantics[i];
         if (semantic.static_vb_index == 1 || semantic.static_attribute == 1) throw std::runtime_error("AGC graphics: statically bound vertex attributes are not implemented");
@@ -256,7 +283,8 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         }
         std::array<std::byte, 4> attribWordBytes{};
         const auto attribWordAddress = attribTableAddr + static_cast<std::uint64_t>(semantic.semantic) * 4u;
-        AgcDriver::GuestMemory::Read(attribWordAddress, attribWordBytes, 4);
+        if (attribCount != 0) std::memcpy(attribWordBytes.data(), &attribBlock[semantic.semantic - attribFirst], 4);
+        else AgcDriver::GuestMemory::Read(attribWordAddress, attribWordBytes, 4);
         record(attribWordAddress, attribWordBytes);
         std::uint32_t attribWord;
         std::memcpy(&attribWord, attribWordBytes.data(), 4);
@@ -267,7 +295,8 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         if (index >= ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex buffer index exceeds the supported domain");
         std::array<std::byte, 16> sharpBytes{};
         const auto sharpAddress = bufferTableAddr + static_cast<std::uint64_t>(index) * 16u;
-        AgcDriver::GuestMemory::Read(sharpAddress, sharpBytes, 4);
+        if (sharpCount != 0) std::memcpy(sharpBytes.data(), sharpBlock[index - sharpFirst].data(), 16);
+        else AgcDriver::GuestMemory::Read(sharpAddress, sharpBytes, 4);
         record(sharpAddress, sharpBytes);
         std::array<std::uint32_t, 4> sharp{};
         std::memcpy(sharp.data(), sharpBytes.data(), 16);
@@ -295,6 +324,33 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         }
         ++info.resourcesNum;
     }
+    return info;
+}
+
+ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const std::byte> header, std::uint64_t headerAddress, std::span<const std::uint32_t> userData, std::vector<DecodeRead>* reads, bool staticAbi, std::uint32_t hiddenUserWords) {
+    static const bool batched = [] {
+        const char* value = std::getenv("APS5_BATCH_VERTEX_DECODE");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    static const bool verify = std::getenv("APS5_VERIFY_VERTEX_DECODE") != nullptr;
+    const auto first = reads != nullptr ? reads->size() : 0;
+    auto info = decodeVertexStageInfoWith(header, headerAddress, userData, reads, staticAbi, hiddenUserWords, batched);
+    if (!verify || !batched) return info;
+    std::vector<DecodeRead> checkReads;
+    const auto check = decodeVertexStageInfoWith(header, headerAddress, userData, reads != nullptr ? &checkReads : nullptr, staticAbi, hiddenUserWords, false);
+    bool same = info.resourcesNum == check.resourcesNum && info.fetchAttribReg == check.fetchAttribReg && info.fetchBufferReg == check.fetchBufferReg && info.fetchEmbedded == check.fetchEmbedded && info.paClVsOutCntl == check.paClVsOutCntl && info.depthRemapMode == check.depthRemapMode;
+    for (std::uint32_t r = 0; same && r < info.resourcesNum; ++r) {
+        same = info.resources[r].fields == check.resources[r].fields && info.resourcesDst[r].registerStart == check.resourcesDst[r].registerStart && info.resourcesDst[r].registersNum == check.resourcesDst[r].registersNum && info.resourcesDst[r].attrId == check.resourcesDst[r].attrId && info.resourcesDst[r].fetchIndex == check.resourcesDst[r].fetchIndex;
+    }
+    if (same && reads != nullptr) {
+        same = reads->size() - first == checkReads.size();
+        for (std::size_t k = 0; same && k < checkReads.size(); ++k) {
+            const auto& a = (*reads)[first + k];
+            const auto& b = checkReads[k];
+            same = a.address == b.address && a.size == b.size && std::equal(a.Bytes().begin(), a.Bytes().end(), b.Bytes().begin());
+        }
+    }
+    if (!same) throw std::runtime_error("APS5_VERIFY_VERTEX_DECODE: the batched vertex stage decode differs from the per-entry decode");
     return info;
 }
 

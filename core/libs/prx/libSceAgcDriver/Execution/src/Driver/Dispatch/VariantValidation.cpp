@@ -89,12 +89,51 @@ bool Driver::vouchedValidation() {
     return enabled;
 }
 
+namespace {
+
+struct ValidateSplit {
+    std::atomic<std::uint64_t> calls{0};
+    std::array<std::atomic<std::uint64_t>, 5> nanoseconds{};
+};
+
+ValidateSplit& validateSplit() {
+    static ValidateSplit split;
+    return split;
+}
+
+struct ValidateLap {
+    bool profile;
+    std::chrono::steady_clock::time_point last = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    void operator()(std::size_t step) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        validateSplit().nanoseconds[step].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()), std::memory_order_relaxed);
+        last = now;
+    }
+};
+
+}
+
+std::string Driver::validateSplitReport() {
+    auto& split = validateSplit();
+    const auto calls = split.calls.exchange(0, std::memory_order_relaxed);
+    std::array<double, 5> us{};
+    for (std::size_t step = 0; step < us.size(); ++step) us[step] = calls != 0 ? static_cast<double>(split.nanoseconds[step].exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(calls) : 0.0;
+    char line[320];
+    std::snprintf(line, sizeof(line), "[draw-cache] validate split (10 s): %llu variant validations, us each: pipeline overlap %.2f, vouch and pending %.2f, pending sync %.2f, image and label checks %.2f, memory compare %.2f\n", static_cast<unsigned long long>(calls), us[0], us[1], us[2], us[3], us[4]);
+    return line;
+}
+
 EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
+    static const bool profileSplit = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profileSplit) validateSplit().calls.fetch_add(1, std::memory_order_relaxed);
+    ValidateLap lap{profileSplit};
     if (live != nullptr) live->clear();
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && std::any_of(variant.runs.begin(), variant.runs.end(), [&](const auto& run) { return pipeline.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); })) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        if (pipeline.Busy() && pipeline.OverlapsAny(variant.runs)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
     }
+    lap(0);
     const bool masked = live != nullptr && !variant.dataPositions.empty();
     const DataMask mask{variant.dataPositions, live};
     thread_local std::vector<VouchedRegions>* vouchedSlot = nullptr;
@@ -118,7 +157,9 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
         }
     }
     const std::span<const std::pair<std::uint64_t, std::uint64_t>> runs = vouched.empty() ? std::span<const std::pair<std::uint64_t, std::uint64_t>>(variant.runs) : std::span<const std::pair<std::uint64_t, std::uint64_t>>(checked);
+    lap(1);
     if (!syncPendingRuns(program, queue, *variant.compiled, regions, runsSynced, pending, sampling, vouched)) return EntryOutcome::Differing;
+    lap(2);
     auto publish = Graphics::Recorder::PublishGeneration();
     auto pendingSerial = Graphics::StorageTexture::PendingSerial();
     auto forget = GuestMemory::ForgetSerial();
@@ -147,9 +188,11 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
         }
     }
 
+    lap(3);
     pending.Load();
     bool unmapped = false;
     if (!validateCaptured(program, queue, regions, *variant.compiled, true, pending, &unmapped, &sampling, masked ? &mask : nullptr, vouched)) return unmapped ? EntryOutcome::Inaccessible : EntryOutcome::Differing;
+    lap(4);
     if (Graphics::Recorder::PublishGeneration() != publish) return EntryOutcome::PublishMoved;
     if (Graphics::StorageTexture::PendingSerial() != pendingSerial) return EntryOutcome::PendingMoved;
     if (GuestMemory::ForgetSerial() != forget) return EntryOutcome::ForgetMoved;

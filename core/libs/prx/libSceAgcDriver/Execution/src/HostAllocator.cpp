@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <intrin.h>
 #include <malloc.h>
@@ -22,7 +23,108 @@ constexpr std::uint16_t Depth(std::size_t sizeClass) {
 struct Cache {
     void* heads[Classes];
     std::uint16_t counts[Classes];
+    std::uint64_t hits;
+    std::uint64_t misses;
+    std::uint64_t large;
+    std::uint64_t cachedFrees;
+    std::uint64_t freed;
+    std::uint64_t batchesIn;
+    std::uint64_t batchesOut;
+    std::uint64_t operations;
 };
+
+struct Batch {
+    Batch* next;
+    std::uint16_t count;
+};
+
+constexpr std::size_t MaxBatches = 256;
+
+struct Transfer {
+    std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    Batch* batches = nullptr;
+    std::size_t count = 0;
+};
+
+Transfer transfers[Classes];
+
+bool Switch(const char* name, std::atomic<int>& state) noexcept {
+    auto value = state.load(std::memory_order_relaxed);
+    if (value == 0) {
+        const DWORD error = GetLastError();
+        char buffer[8];
+        value = GetEnvironmentVariableA(name, buffer, sizeof(buffer)) != 0 ? 2 : 1;
+        SetLastError(error);
+        state.store(value, std::memory_order_relaxed);
+    }
+    return value == 2;
+}
+
+bool TransferEnabled() noexcept {
+    static std::atomic<int> state{0};
+    auto value = state.load(std::memory_order_relaxed);
+    if (value == 0) {
+        const DWORD error = GetLastError();
+        char buffer[8] = {};
+        const DWORD length = GetEnvironmentVariableA("APS5_ALLOC_TRANSFER", buffer, sizeof(buffer));
+        value = length == 1 && buffer[0] == '0' ? 1 : 2;
+        SetLastError(error);
+        state.store(value, std::memory_order_relaxed);
+    }
+    return value == 2;
+}
+
+bool StatsEnabled() noexcept {
+    static std::atomic<int> state{0};
+    return Switch("APS5_ALLOC_STATS", state);
+}
+
+void Lock(Transfer& transfer) noexcept {
+    while (transfer.busy.test_and_set(std::memory_order_acquire)) _mm_pause();
+}
+
+void Unlock(Transfer& transfer) noexcept {
+    transfer.busy.clear(std::memory_order_release);
+}
+
+bool PushBatch(std::size_t sizeClass, void* head, std::uint16_t count) noexcept {
+    auto& transfer = transfers[sizeClass];
+    auto* batch = static_cast<Batch*>(head);
+    *(reinterpret_cast<void**>(static_cast<char*>(head) + sizeof(Batch))) = *static_cast<void**>(head);
+    batch->count = count;
+    Lock(transfer);
+    if (transfer.count >= MaxBatches) {
+        Unlock(transfer);
+        return false;
+    }
+    batch->next = transfer.batches;
+    transfer.batches = batch;
+    ++transfer.count;
+    Unlock(transfer);
+    return true;
+}
+
+void* PopBatch(std::size_t sizeClass, std::uint16_t& count) noexcept {
+    auto& transfer = transfers[sizeClass];
+    Lock(transfer);
+    auto* batch = transfer.batches;
+    if (batch != nullptr) {
+        transfer.batches = batch->next;
+        --transfer.count;
+    }
+    Unlock(transfer);
+    if (batch == nullptr) return nullptr;
+    count = batch->count;
+    void* head = batch;
+    *static_cast<void**>(head) = *(reinterpret_cast<void**>(static_cast<char*>(head) + sizeof(Batch)));
+    return head;
+}
+
+void Report(Cache* cache) noexcept {
+    if ((++cache->operations & ((std::uint64_t{1} << 21) - 1)) != 0 || !StatsEnabled()) return;
+    std::fprintf(stderr, "[alloc] thread %lu: %llu cache hits, %llu misses to malloc, %llu above %zu bytes, %llu frees kept, %llu freed, batches %llu taken / %llu given\n", GetCurrentThreadId(), static_cast<unsigned long long>(cache->hits), static_cast<unsigned long long>(cache->misses), static_cast<unsigned long long>(cache->large), LargestCached, static_cast<unsigned long long>(cache->cachedFrees), static_cast<unsigned long long>(cache->freed), static_cast<unsigned long long>(cache->batchesIn), static_cast<unsigned long long>(cache->batchesOut));
+    cache->hits = cache->misses = cache->large = cache->cachedFrees = cache->freed = cache->batchesIn = cache->batchesOut = 0;
+}
 
 Cache* const Closed = reinterpret_cast<Cache*>(std::uintptr_t{1});
 
@@ -114,13 +216,28 @@ void* TryAllocate(std::size_t bytes) noexcept {
     if (bytes <= LargestCached) {
         const auto sizeClass = (bytes - 1) / Granule;
         if (auto* cache = CurrentCache()) {
+            Report(cache);
+            if (cache->heads[sizeClass] == nullptr && TransferEnabled()) {
+                std::uint16_t count = 0;
+                if (void* head = PopBatch(sizeClass, count)) {
+                    cache->heads[sizeClass] = head;
+                    cache->counts[sizeClass] = count;
+                    ++cache->batchesIn;
+                }
+            }
             if (void* block = cache->heads[sizeClass]) {
                 cache->heads[sizeClass] = *static_cast<void**>(block);
                 --cache->counts[sizeClass];
+                ++cache->hits;
                 return block;
             }
+            ++cache->misses;
         }
         return std::malloc((sizeClass + 1) * Granule);
+    }
+    if (auto* cache = CurrentCache()) {
+        Report(cache);
+        ++cache->large;
     }
     return std::malloc(bytes);
 }
@@ -140,13 +257,20 @@ void Release(void* block, std::size_t bytes = 0) noexcept {
         const auto usable = bytes != 0 && bytes % Granule == 0 ? bytes : _msize(block);
         if (usable >= Granule && usable < LargestCached + Granule) {
             const auto sizeClass = usable / Granule - 1;
+            if (cache->counts[sizeClass] >= Depth(sizeClass) && TransferEnabled() && usable >= sizeof(Batch) + sizeof(void*) && PushBatch(sizeClass, cache->heads[sizeClass], cache->counts[sizeClass])) {
+                cache->heads[sizeClass] = nullptr;
+                cache->counts[sizeClass] = 0;
+                ++cache->batchesOut;
+            }
             if (cache->counts[sizeClass] < Depth(sizeClass)) {
                 *static_cast<void**>(block) = cache->heads[sizeClass];
                 cache->heads[sizeClass] = block;
                 ++cache->counts[sizeClass];
+                ++cache->cachedFrees;
                 return;
             }
         }
+        ++cache->freed;
     }
     std::free(block);
 }

@@ -221,6 +221,12 @@ struct SrtTapeSlot {
     std::shared_ptr<const void> tape;
 };
 
+struct DirectUserWordSlot {
+    std::once_flag once;
+    std::atomic<bool> ready{false};
+    std::shared_ptr<const void> words;
+};
+
 struct IrResourcePlan {
     IrShaderStage stage = IrShaderStage::Unknown;
     std::uint64_t shaderHash = 0;
@@ -248,6 +254,7 @@ struct IrResourcePlan {
     ShaderInfo info;
     UniformFillPlan uniformFill;
     std::shared_ptr<SrtTapeSlot> tapeSlot = std::make_shared<SrtTapeSlot>();
+    std::shared_ptr<DirectUserWordSlot> directSlot = std::make_shared<DirectUserWordSlot>();
 };
 
 }

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -38,16 +39,16 @@ std::size_t DrawPipeline::Depth() {
     static const std::size_t depth = [] {
         const char* text = std::getenv("APS5_PIPELINED_DRAWS");
         if (std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr || std::getenv("APS5_DRAW_DRAIN") != nullptr || std::getenv("APS5_DRAIN_ALL") != nullptr || std::getenv("APS5_NO_WORDWISE_CAPTURE") != nullptr) return std::size_t{0};
-        if (text == nullptr) return std::size_t{8};
+        if (text == nullptr) return std::size_t{64};
         const auto value = std::strtoull(text, nullptr, 10);
-        return value == 0 ? std::size_t{0} : value == 1 ? std::size_t{8} : static_cast<std::size_t>(std::min<unsigned long long>(value, 256));
+        return value == 0 ? std::size_t{0} : value == 1 ? std::size_t{64} : static_cast<std::size_t>(std::min<unsigned long long>(value, 256));
     }();
     return depth;
 }
 
 std::size_t DrawPipeline::QueuedItems() {
     auto& pipeline = Queue0();
-    std::lock_guard lock(pipeline.mutex);
+    auto lock = pipeline.lockQueue();
     return pipeline.items.size();
 }
 
@@ -80,7 +81,7 @@ void DrawPipeline::rethrowFailure() {
 
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    std::unique_lock lock(mutex);
+    auto lock = lockQueue();
     rethrowFailure();
     if (closing) {
         lock.unlock();
@@ -99,6 +100,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     depthSum += items.size();
     ++enqueued;
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
+    addWrites(writes);
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads)});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
@@ -148,7 +150,7 @@ void DrawPipeline::run() {
         Commit* commit = nullptr;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
-            std::unique_lock lock(mutex);
+            auto lock = lockQueue();
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
@@ -175,7 +177,8 @@ void DrawPipeline::run() {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
-        std::lock_guard lock(mutex);
+        auto lock = lockQueue();
+        removeWrites(items.front().writes);
         items.pop_front();
         ++commits;
         commitNs += spent;
@@ -190,7 +193,7 @@ void DrawPipeline::run() {
 void DrawPipeline::Stop() {
     std::thread committer;
     {
-        std::lock_guard lock(mutex);
+        auto lock = lockQueue();
         closing = true;
         committer = std::move(thread);
     }
@@ -206,7 +209,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
-    std::unique_lock lock(mutex);
+    auto lock = lockQueue();
     ++idleWaiters;
     idle.wait(lock, [&] { return items.empty(); });
     --idleWaiters;
@@ -221,11 +224,17 @@ std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
     return Queue0().drainRequests[std::min<std::uint32_t>(opcode, 0x100)].load(std::memory_order_relaxed);
 }
 
+std::unique_lock<std::mutex> DrawPipeline::lockQueue() {
+    LockSpinning(mutex, HandoffSpinWindow());
+    return std::unique_lock<std::mutex>(mutex, std::adopt_lock);
+}
+
 bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0 || std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr) return false;
+    static const bool unordered = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr;
+    if (bytes == 0 || unordered) return false;
     const auto end = address + bytes;
     auto& pipeline = Queue0();
-    std::lock_guard lock(pipeline.mutex);
+    auto lock = pipeline.lockQueue();
     heldReadQueries.fetch_add(1, std::memory_order_relaxed);
     for (const auto& item : pipeline.items) {
         for (const auto& [begin, limit] : item.reads) {
@@ -238,14 +247,14 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
 }
 
 void DrawPipeline::ReleaseRunningReads() {
-    std::lock_guard lock(mutex);
+    auto lock = lockQueue();
     if (!items.empty()) items.front().reads.clear();
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > 8) return std::nullopt;
     const auto end = address + bytes;
-    std::lock_guard lock(mutex);
+    auto lock = lockQueue();
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
         const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
         if (!overlaps) continue;
@@ -257,15 +266,55 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
     return std::nullopt;
 }
 
-bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
-    const auto end = address + bytes;
-    std::lock_guard lock(mutex);
+void DrawPipeline::addWrites(const std::vector<Range>& writes) {
+    for (const auto& [begin, limit] : writes) {
+        const auto held = std::find_if(queuedWrites.begin(), queuedWrites.end(), [&](const QueuedWrite& write) { return write.begin == begin && write.limit == limit; });
+        if (held != queuedWrites.end()) ++held->count;
+        else queuedWrites.push_back({begin, limit, 1});
+    }
+}
+
+void DrawPipeline::removeWrites(const std::vector<Range>& writes) {
+    for (const auto& [begin, limit] : writes) {
+        const auto held = std::find_if(queuedWrites.begin(), queuedWrites.end(), [&](const QueuedWrite& write) { return write.begin == begin && write.limit == limit; });
+        if (held == queuedWrites.end()) throw std::logic_error("draw pipeline write summary lost a queued write");
+        if (--held->count != 0) continue;
+        *held = queuedWrites.back();
+        queuedWrites.pop_back();
+    }
+}
+
+bool DrawPipeline::scanOverlaps(std::span<const Range> ranges) const {
     for (const auto& item : items) {
         for (const auto& [begin, limit] : item.writes) {
-            if (address < limit && begin < end) return true;
+            for (const auto& [address, end] : ranges) {
+                if (address < limit && begin < end) return true;
+            }
         }
     }
     return false;
+}
+
+bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    static const bool verify = std::getenv("APS5_VERIFY_PIPELINE_WRITES") != nullptr;
+    auto lock = lockQueue();
+    bool overlaps = false;
+    for (const auto& write : queuedWrites) {
+        for (const auto& [address, end] : ranges) {
+            if (address < write.limit && write.begin < end) {
+                overlaps = true;
+                break;
+            }
+        }
+        if (overlaps) break;
+    }
+    if (verify && overlaps != scanOverlaps(ranges)) throw std::logic_error("APS5_VERIFY_PIPELINE_WRITES: the queued write summary disagrees with the queued draws");
+    return overlaps;
+}
+
+bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
+    const std::array<Range, 1> range{Range{address, address + bytes}};
+    return OverlapsAny(range);
 }
 
 }

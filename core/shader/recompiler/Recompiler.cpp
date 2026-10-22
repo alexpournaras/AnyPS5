@@ -979,7 +979,25 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     return entry->module;
 }
 
+struct MaterializeSplit {
+    std::atomic<std::uint64_t> header{0}, plan{0}, module{0}, tables{0}, populate{0}, assemble{0}, copy{0}, copies{0}, bindingCopy{0}, bindings{0}, filledLists{0};
+};
+
+MaterializeSplit& materializeSplit() {
+    static MaterializeSplit split;
+    return split;
+}
+
 RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto lap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto mark = [&](std::atomic<std::uint64_t>& slot) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        slot.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lap).count()), std::memory_order_relaxed);
+        lap = now;
+    };
+    auto& split = materializeSplit();
     RecompileResult result;
     const auto& artifact = variant.artifact;
     static_cast<CompiledShaderArtifact&>(result) = {
@@ -1013,7 +1031,9 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         const auto index = reg - request.context.userDataBaseRegister;
         result.userDataRegisterReads |= reg >= request.context.userDataBaseRegister && index < 64u ? std::uint64_t{1} << index : ~std::uint64_t{0};
     }
+    mark(split.header);
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
+    mark(split.plan);
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
     struct LocalModuleKeyStorage {};
@@ -1119,10 +1139,13 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     } else {
         result.spirv = artifact.spirv;
     }
+    mark(split.module);
     const auto resolved = ResourceMaterializer::ResolveImageTablesShared(variant.info.info, snapshot, artifact.variantId);
+    mark(split.tables);
     const auto& tables = *resolved;
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
+    mark(split.populate);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
@@ -1158,6 +1181,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.imageTableShader = snapshot.tables.shader;
         result.imageTableFaults = tables.faults;
     }
+    mark(split.assemble);
     return result;
 }
 
@@ -1334,6 +1358,16 @@ void reportResultMemo() {
     const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
+    auto& split = materializeSplit();
+    const auto perMiss = [&](std::atomic<std::uint64_t>& slot) { return misses != 0 ? static_cast<double>(slot.exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(misses) : 0.0; };
+    const auto header = perMiss(split.header), plan = perMiss(split.plan), module = perMiss(split.module), tables = perMiss(split.tables), populated = perMiss(split.populate), assemble = perMiss(split.assemble);
+    const auto copies = split.copies.exchange(0, std::memory_order_relaxed);
+    const auto copy = split.copy.exchange(0, std::memory_order_relaxed);
+    const auto bindingCopy = split.bindingCopy.exchange(0, std::memory_order_relaxed);
+    const auto bindingCount = split.bindings.exchange(0, std::memory_order_relaxed);
+    const auto filledLists = split.filledLists.exchange(0, std::memory_order_relaxed);
+    if (copies != 0) std::fprintf(stderr, "[recompile] result copy split: bindings alone %.2f us, %.1f bindings with %.1f non-empty lists per result\n", static_cast<double>(bindingCopy) / 1000.0 / static_cast<double>(copies), static_cast<double>(bindingCount) / static_cast<double>(copies), static_cast<double>(filledLists) / static_cast<double>(copies));
+    std::fprintf(stderr, "[recompile] materialize split (10 s, us per miss): header %.2f, binding plan %.2f, module %.2f, tables %.2f, populate %.2f, assemble %.2f; copying a finished result %.2f us (%llu samples)\n", header, plan, module, tables, populated, assemble, copies != 0 ? static_cast<double>(copy) / 1000.0 / static_cast<double>(copies) : 0.0, static_cast<unsigned long long>(copies));
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
@@ -1436,6 +1470,22 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
     result->cacheHit = cacheHit;
+    if (profile && (counters.misses.load(std::memory_order_relaxed) & 15u) == 0u) {
+        const auto copyStarted = std::chrono::steady_clock::now();
+        const RecompileResult copy(*result);
+        auto& split = materializeSplit();
+        split.copy.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - copyStarted).count()), std::memory_order_relaxed);
+        const auto bindingsStarted = std::chrono::steady_clock::now();
+        const std::vector<DescriptorBinding> bindingsCopy(result->bindings);
+        split.bindingCopy.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - bindingsStarted).count()), std::memory_order_relaxed);
+        split.bindings.fetch_add(bindingsCopy.size(), std::memory_order_relaxed);
+        std::uint64_t filled = 0;
+        for (const auto& binding : bindingsCopy) {
+            filled += !binding.guestDescriptor.empty() + !binding.samplerDepthCompare.empty() + !binding.imageWritten.empty() + !binding.imageDepthCompare.empty() + !binding.imageAtomic.empty() + !binding.imageAtomic64.empty() + !binding.imageShapes.empty() + !binding.bufferAtomic.empty() + !binding.bufferWritten.empty() + !binding.samplerUnnormalized.empty() + !binding.samplerIntegerBorder.empty() + !binding.samplerCoordinatesIgnored.empty() + !binding.imageUnnormalized.empty() + !binding.imageUnnormalizedBaseLevel.empty() + !binding.imageSamplers.empty() + !binding.bufferRead.empty() + !binding.bufferExtent.empty();
+        }
+        split.filledLists.fetch_add(filled, std::memory_order_relaxed);
+        split.copies.fetch_add(copy.bindings.size() == copy.bindings.size() ? 1u : 0u, std::memory_order_relaxed);
+    }
     if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     counters.misses.fetch_add(1, std::memory_order_relaxed);
     std::shared_ptr<const RecompileResult> shared = std::move(result);
@@ -1600,6 +1650,81 @@ bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& 
     if (!handle.artifact->artifact.stencilReferences.empty() && (prepared.stencilReferenceDword >= layout.pushConstantSizeBytes / 4u || prepared.stencilReferenceDword != (usesPush ? words : 0u))) return false;
     if (!std::ranges::equal(key, handle.staticKey) || handle.source->code.size() != request.shader.code.size()) return false;
     return handle.source->code.data() == request.shader.code.data() || std::ranges::equal(handle.source->code, request.shader.code);
+}
+
+std::uint64_t ValuePositions(const ResourceCapture& capture, const RecompileResult& result, std::vector<ValuePosition>& positions) {
+    positions.clear();
+    if (capture.plan == nullptr) return 0;
+    const auto& direct = ResourceMaterializer::DirectUserWords(*capture.plan);
+    const auto& snapshot = capture.snapshot;
+    const auto same = [](const DescriptorValue& value, std::span<const std::uint32_t> words, bool image) {
+        for (std::size_t dword = 0; dword < words.size(); ++dword) {
+            const auto mask = image && dword == 3u ? ~0xfffu : ~0u;
+            if (((value.dwords[dword] ^ words[dword]) & mask) != 0u) return false;
+        }
+        return true;
+    };
+    std::uint64_t shareable = 0;
+    std::uint64_t refused = 0;
+    for (const auto& patch : direct.patches) {
+        const auto bit = std::uint64_t{1} << patch.word;
+        const bool image = patch.target == DirectTarget::Image;
+        const auto& values = image ? snapshot.images : snapshot.buffers;
+        const auto stride = image ? 8u : 4u;
+        if (patch.target == DirectTarget::Sampler || patch.dword > 1u || patch.word >= snapshot.userData.size() || patch.index >= values.size()) {
+            refused |= bit;
+            continue;
+        }
+        const auto& value = values[patch.index];
+        if (value.dwordCount != stride || value.dwords[patch.dword] != snapshot.userData[patch.word]) {
+            refused |= bit;
+            continue;
+        }
+        bool unique = true;
+        for (std::size_t other = 0; other < values.size() && unique; ++other) {
+            if (other != patch.index && values[other].dwordCount == stride && same(value, std::span<const std::uint32_t>(values[other].dwords.data(), stride), image)) unique = false;
+        }
+        if (!unique) {
+            refused |= bit;
+            continue;
+        }
+        const auto role = image ? DescriptorRole::GuestImages : DescriptorRole::GuestBuffers;
+        std::size_t found = 0;
+        for (std::uint32_t index = 0; index < result.bindings.size(); ++index) {
+            const auto& binding = result.bindings[index];
+            if (binding.role != role || binding.count == 0u || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * stride) continue;
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                if (!same(value, std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * stride, stride), image)) continue;
+                positions.push_back({patch.word, index, element, patch.dword, image ? ValueField::Image : ValueField::Buffer});
+                ++found;
+            }
+        }
+        if (image && (value.dwords[0] != 0u || (value.dwords[1] & 0xffu) != 0u)) {
+            const auto matches = [&](std::span<const std::uint32_t> words, std::size_t at) { return std::equal(value.dwords.begin(), value.dwords.begin() + 8, words.begin() + static_cast<std::ptrdiff_t>(at)); };
+            for (std::uint32_t index = 0; index < result.bindings.size(); ++index) {
+                const auto& binding = result.bindings[index];
+                if (binding.role != DescriptorRole::ShaderData) continue;
+                const auto words = std::span<const std::uint32_t>(binding.guestDescriptor);
+                for (std::size_t at = 0; at + 8u <= words.size(); ++at) {
+                    if (!matches(words, at)) continue;
+                    positions.push_back({patch.word, index, static_cast<std::uint32_t>(at), patch.dword, ValueField::ShaderDataImage});
+                    ++found;
+                }
+            }
+            std::vector<std::uint32_t> push(result.pushConstants.size() / sizeof(std::uint32_t));
+            if (!push.empty()) std::memcpy(push.data(), result.pushConstants.data(), push.size() * sizeof(std::uint32_t));
+            for (std::size_t at = 0; at + 8u <= push.size(); ++at) {
+                if (!matches(push, at)) continue;
+                positions.push_back({patch.word, 0u, static_cast<std::uint32_t>(at), patch.dword, ValueField::PushImage});
+                ++found;
+            }
+        }
+        if (found == 0) refused |= bit;
+        else shareable |= bit;
+    }
+    shareable &= ~refused;
+    std::erase_if(positions, [&](const ValuePosition& position) { return (shareable >> position.word & 1u) == 0u; });
+    return shareable;
 }
 
 std::span<const std::uint32_t> GetPreparedCode(const SourceHandle& handle) {

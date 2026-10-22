@@ -46,6 +46,11 @@ struct DispatchVariant {
     std::uint64_t relocatableWords = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    std::uint64_t walkedValues = 0, walkedBases = 0;
+    std::vector<ShaderRecompiler::ValuePosition> valuePositions;
+    std::uint64_t shareWords = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> walkSpans;
+    bool walkKnown = false;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
     std::shared_ptr<ShaderMemory> memory;

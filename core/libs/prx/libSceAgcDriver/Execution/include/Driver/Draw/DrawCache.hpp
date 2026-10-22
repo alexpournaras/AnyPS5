@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
@@ -99,6 +100,9 @@ struct DrawEntryCounters {
     std::array<std::uint64_t, 6> registerKeyMissChanges{};
     std::uint64_t differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
     std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
+    std::array<std::uint64_t, 5> dataStageMisses{};
+    std::unordered_map<std::uint32_t, std::uint64_t> dataWordChanges;
+    std::uint64_t sharedCandidates = 0, sharedStages = 0, sharedPushOffset = 0, sharedVertexShape = 0, sharedDescriptorShape = 0, sharedVerified = 0;
     std::uint64_t stageDataHits = 0, stageDataWords = 0, stageDataVerified = 0, stageDataInserts = 0, stageDataPositions = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -127,6 +131,9 @@ struct StageCapture {
     std::uint32_t pushOffset = 0;
     ShaderRecompiler::SrtUserDataUse userDataUse;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    std::vector<ShaderRecompiler::ValuePosition> valuePositions;
+    std::uint64_t shareWords = 0;
+    bool shared = false;
 };
 
 struct RelocatableUserWord {

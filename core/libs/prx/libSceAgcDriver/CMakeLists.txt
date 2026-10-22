@@ -290,6 +290,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostAllocator.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/NativeTls.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTraceThread.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
@@ -440,7 +441,7 @@ endif()
 set_target_properties(libSceAgcDriver PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(libSceAgcDriver)
 if(WIN32)
-    target_link_options(libSceAgcDriver PRIVATE LINKER:--exclude-symbols=_Znwy:_Znay:_ZnwyRKSt9nothrow_t:_ZnayRKSt9nothrow_t:_ZdlPv:_ZdaPv:_ZdlPvy:_ZdaPvy:_ZdlPvRKSt9nothrow_t:_ZdaPvRKSt9nothrow_t)
+    target_link_options(libSceAgcDriver PRIVATE LINKER:--exclude-symbols=_Znwy:_Znay:_ZnwyRKSt9nothrow_t:_ZnayRKSt9nothrow_t:_ZdlPv:_ZdaPv:_ZdlPvy:_ZdaPvy:_ZdlPvRKSt9nothrow_t:_ZdaPvRKSt9nothrow_t:__emutls_get_address)
 endif()
 
 if(BUILD_TESTING)
@@ -558,7 +559,12 @@ if(BUILD_TESTING AND WIN32)
     target_link_libraries(agc_driver_host_allocator_tests PRIVATE libc)
     configure_windows_unwind(agc_driver_host_allocator_tests)
     add_test(NAME agc_driver_host_allocator COMMAND agc_driver_host_allocator_tests)
-    set_tests_properties(agc_driver_host_allocator PROPERTIES TIMEOUT 30 ENVIRONMENT_MODIFICATION
+    add_test_executable(agc_driver_native_tls_tests tests/NativeTls.cpp Execution/src/NativeTls.cpp)
+    target_link_libraries(agc_driver_native_tls_tests PRIVATE libc)
+    configure_windows_unwind(agc_driver_native_tls_tests)
+    add_test(NAME agc_driver_native_tls COMMAND agc_driver_native_tls_tests)
+    add_test(NAME agc_driver_native_tls_library COMMAND agc_driver_native_tls_tests library)
+    set_tests_properties(agc_driver_host_allocator agc_driver_native_tls agc_driver_native_tls_library PROPERTIES TIMEOUT 30 ENVIRONMENT_MODIFICATION
         "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
 endif()
 

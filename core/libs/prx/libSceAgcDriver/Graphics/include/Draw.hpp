@@ -21,12 +21,27 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 
+struct EarlyDrawKey {
+    std::vector<std::uint32_t> key;
+};
+EarlyDrawKey BuildEarlyDrawKey(VkDevice device, const State& state, std::span<const CompiledShader> shaders);
+
+class EarlyDrawKeyScope {
+public:
+    EarlyDrawKeyScope(EarlyDrawKey& key, const State& state, std::span<const CompiledShader> shaders);
+    ~EarlyDrawKeyScope();
+    EarlyDrawKeyScope(const EarlyDrawKeyScope&) = delete;
+    EarlyDrawKeyScope& operator=(const EarlyDrawKeyScope&) = delete;
+};
+
 struct DrawInputCopy {
     std::shared_ptr<Buffer> buffer;
     bool reused = false;
     std::uint32_t derived = 0;
     std::uint64_t generation = 0;
     std::uint64_t registryGeneration = 0;
+    std::array<std::uint64_t, 3> stamp{};
+    bool stamped = false;
 };
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);

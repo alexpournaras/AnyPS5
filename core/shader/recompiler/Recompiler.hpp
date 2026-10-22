@@ -452,6 +452,93 @@ enum class DescriptorRole {
     ImageStorageTable
 };
 
+template<typename T>
+class SharedList {
+public:
+    using value_type = T;
+    using size_type = std::size_t;
+    using const_reference = typename std::vector<T>::const_reference;
+    using reference = typename std::vector<T>::reference;
+    using const_iterator = typename std::vector<T>::const_iterator;
+    using iterator = const_iterator;
+
+    SharedList() = default;
+    SharedList(std::vector<T> values) { if (!values.empty()) data = std::make_shared<std::vector<T>>(std::move(values)); }
+    SharedList(std::initializer_list<T> values) : SharedList(std::vector<T>(values)) {}
+    SharedList(size_type count, const T& value) : SharedList(std::vector<T>(count, value)) {}
+    template<typename TIterator>
+    SharedList(TIterator first, TIterator last) : SharedList(std::vector<T>(first, last)) {}
+
+    [[nodiscard]] const std::vector<T>& Get() const {
+        static const std::vector<T> none;
+        return data != nullptr ? *data : none;
+    }
+    operator const std::vector<T>&() const { return Get(); }
+    std::vector<T>& Edit() {
+        if (data == nullptr) data = std::make_shared<std::vector<T>>();
+        else if (data.use_count() > 1) data = std::make_shared<std::vector<T>>(*data);
+        return *data;
+    }
+
+    [[nodiscard]] size_type size() const { return data != nullptr ? data->size() : 0; }
+    [[nodiscard]] bool empty() const { return data == nullptr || data->empty(); }
+    [[nodiscard]] const_reference operator[](size_type index) const { return (*data)[index]; }
+    [[nodiscard]] const_reference at(size_type index) const { return Get().at(index); }
+    [[nodiscard]] const_reference front() const { return data->front(); }
+    [[nodiscard]] const_reference back() const { return data->back(); }
+    [[nodiscard]] const_iterator begin() const { return Get().begin(); }
+    [[nodiscard]] const_iterator end() const { return Get().end(); }
+    [[nodiscard]] const_iterator cbegin() const { return Get().begin(); }
+    [[nodiscard]] const_iterator cend() const { return Get().end(); }
+
+    reference operator[](size_type index) { return Edit()[index]; }
+    reference front() { return Edit().front(); }
+    reference back() { return Edit().back(); }
+    void push_back(const T& value) { Edit().push_back(value); }
+    template<typename... TArgs>
+    decltype(auto) emplace_back(TArgs&&... args) { return Edit().emplace_back(std::forward<TArgs>(args)...); }
+    void resize(size_type count) { Edit().resize(count); }
+    void resize(size_type count, const T& value) { Edit().resize(count, value); }
+    void assign(size_type count, const T& value) { Edit().assign(count, value); }
+    template<typename TIterator>
+    void assign(TIterator first, TIterator last) { Edit().assign(first, last); }
+    void reserve(size_type count) { Edit().reserve(count); }
+    void clear() { data.reset(); }
+    SharedList& operator=(std::vector<T> values) {
+        *this = SharedList(std::move(values));
+        return *this;
+    }
+    SharedList& operator=(std::initializer_list<T> values) {
+        *this = SharedList(values);
+        return *this;
+    }
+
+    friend bool operator==(const SharedList& first, const SharedList& second) { return first.data == second.data || first.Get() == second.Get(); }
+    friend bool operator==(const SharedList& first, const std::vector<T>& second) { return first.Get() == second; }
+
+private:
+    std::shared_ptr<std::vector<T>> data;
+};
+
+class ContentKeyMemo {
+public:
+    struct Entry {
+        std::uint32_t flags = 0;
+        std::vector<std::uint32_t> words;
+    };
+    ContentKeyMemo() = default;
+    ContentKeyMemo(const ContentKeyMemo&) noexcept {}
+    ContentKeyMemo& operator=(const ContentKeyMemo&) noexcept {
+        entry.store(nullptr, std::memory_order_release);
+        return *this;
+    }
+    [[nodiscard]] std::shared_ptr<const Entry> Load() const { return entry.load(std::memory_order_acquire); }
+    void Store(std::shared_ptr<const Entry> value) const { entry.store(std::move(value), std::memory_order_release); }
+
+private:
+    mutable std::atomic<std::shared_ptr<const Entry>> entry;
+};
+
 struct DescriptorBinding {
     DescriptorKind kind;
     DescriptorRole role;
@@ -461,31 +548,31 @@ struct DescriptorBinding {
     std::vector<std::uint32_t> guestDescriptor;
     bool readOnly = false;
     std::optional<DescriptorImageShape> imageShape;
-    std::vector<bool> samplerDepthCompare;
+    SharedList<bool> samplerDepthCompare;
     // Guest image elements the shader stores to (or updates atomically); the others are only read.
-    std::vector<bool> imageWritten;
-    std::vector<bool> imageDepthCompare;
-    std::vector<bool> imageAtomic;
-    std::vector<bool> imageAtomic64;
-    std::vector<DescriptorImageShape> imageShapes;
+    SharedList<bool> imageWritten;
+    SharedList<bool> imageDepthCompare;
+    SharedList<bool> imageAtomic;
+    SharedList<bool> imageAtomic64;
+    SharedList<DescriptorImageShape> imageShapes;
     // Guest buffer elements the shader updates atomically (one entry per element of a GuestBuffers
     // binding, empty otherwise). An atomic on a host-imported range is a serialized PCIe round trip
     // (~0.4-0.5 us each on NVIDIA), so a driver may keep these elements in device-local memory.
-    std::vector<bool> bufferAtomic;
+    SharedList<bool> bufferAtomic;
     // Guest buffer elements the shader may store to through this V# (any store or atomic in the
     // program, whatever its offset), one entry per element of a GuestBuffers binding, empty
     // otherwise. A false entry is proved: every access of that element is a load. A driver may then
     // skip the write-back and the pending-write note for the element; an element beyond the vector
     // (a producer that does not fill it) must be treated as written.
-    std::vector<bool> bufferWritten;
-    std::vector<bool> samplerUnnormalized;
-    std::vector<bool> samplerIntegerBorder;
-    std::vector<bool> samplerCoordinatesIgnored;
-    std::vector<bool> imageUnnormalized;
-    std::vector<bool> imageUnnormalizedBaseLevel;
-    std::vector<std::uint32_t> imageSamplers;
-    std::vector<bool> bufferRead;
-    std::vector<std::uint32_t> bufferExtent;
+    SharedList<bool> bufferWritten;
+    SharedList<bool> samplerUnnormalized;
+    SharedList<bool> samplerIntegerBorder;
+    SharedList<bool> samplerCoordinatesIgnored;
+    SharedList<bool> imageUnnormalized;
+    SharedList<bool> imageUnnormalizedBaseLevel;
+    SharedList<std::uint32_t> imageSamplers;
+    SharedList<bool> bufferRead;
+    SharedList<std::uint32_t> bufferExtent;
 };
 
 struct ImageTableEntryPoison {
@@ -493,6 +580,15 @@ struct ImageTableEntryPoison {
     std::uint32_t dwordCount = 0;
     std::uint32_t resource = 0;
     std::uint32_t reason = 0;
+};
+
+enum class ValueField : std::uint8_t { Buffer, Image, ShaderDataImage, PushImage };
+struct ValuePosition {
+    std::uint32_t word = 0;
+    std::uint32_t binding = 0;
+    std::uint32_t element = 0;
+    std::uint32_t dword = 0;
+    ValueField field = ValueField::Buffer;
 };
 
 struct VertexAttribute {
@@ -707,6 +803,7 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;
+    ContentKeyMemo contentKey;
     [[nodiscard]] std::uint64_t PipelineVariantId() const { return specializationId != 0 ? specializationId : variantId; }
     [[nodiscard]] PipelineIdentity Identity() const {
         const auto hash = spirv.ContentHash();

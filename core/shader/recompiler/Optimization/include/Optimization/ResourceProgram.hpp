@@ -6,6 +6,8 @@
 #include "Optimization/SrtWalker.hpp"
 #include <cstdint>
 #include <memory>
+#include <span>
+#include <vector>
 
 namespace ShaderRecompiler {
 
@@ -71,6 +73,7 @@ private:
     RecompileRequest request;
     std::shared_ptr<const SourceHandle> handle;
 };
+[[nodiscard]] std::uint64_t ValuePositions(const ResourceCapture& capture, const RecompileResult& result, std::vector<ValuePosition>& positions);
 [[nodiscard]] std::span<const std::uint32_t> GetPreparedCode(const SourceHandle& handle);
 [[nodiscard]] std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& request);
 [[nodiscard]] std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& request, ShaderPreparationContext* preparation);

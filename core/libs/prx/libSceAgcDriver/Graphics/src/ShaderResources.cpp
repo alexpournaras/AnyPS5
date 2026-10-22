@@ -1564,6 +1564,24 @@ void ShaderResources::forgetDeferredInputs() {
     deferredSnapshots = {};
 }
 
+bool DynamicSnapshotsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_DYNAMIC_SNAPSHOTS");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+bool IsStorageBuffer(VkDescriptorType type) {
+    return type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+}
+
+bool DynamicStorageBuffers(const Context& context, bool graphics, bool updateAfterBind, const std::array<std::uint32_t, 2>& storageBuffers) {
+    if (!DynamicSnapshotsEnabled() || !graphics || updateAfterBind) return false;
+    const auto limit = context.limits.maxDescriptorSetStorageBuffersDynamic;
+    return storageBuffers[0] <= limit && storageBuffers[1] <= limit;
+}
+
 void ShaderResources::build(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {
     buildPrepare(shaders, target, colorAttachments, indexAddress, indexBytes);
     buildComplete();
@@ -2059,6 +2077,20 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         guestMemory.UploadPrepare(usesBda);
         timing.uploadMs = phase(BuildPhase::Upload);
         splitSets = SplitsSets(context, shaders);
+        {
+            std::array<std::uint32_t, 2> setBuffers{};
+            bool anyUpdateAfterBind = updateAfterBind;
+            for (const auto& binding : bindings) {
+                anyUpdateAfterBind |= (binding.flags & VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT) != 0;
+                if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) setBuffers[setOf(binding)] += binding.layout.descriptorCount;
+            }
+            dynamicBuffers = DynamicStorageBuffers(context, drawBuild, anyUpdateAfterBind, setBuffers);
+            if (dynamicBuffers) {
+                for (auto& binding : bindings) {
+                    if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) binding.layout.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+                }
+            }
+        }
         std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
         bool tablesUpdateAfterBind = false;
         for (const auto& binding : bindings) {
@@ -2140,7 +2172,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             // The set is sized from the plan: every image element becomes exactly one descriptor
             // when stage B looks it up.
             std::vector<VkDescriptorPoolSize> sizes;
-            if (storageBuffers != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<std::uint32_t>(storageBuffers)});
+            if (storageBuffers != 0) sizes.push_back({dynamicBuffers ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<std::uint32_t>(storageBuffers)});
             const auto tableDescriptors = tableBindings[0] != std::numeric_limits<std::size_t>::max() ? tableDescriptorCount(0) : 0u;
             if (plannedSampledImages + tableDescriptors != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, plannedSampledImages + tableDescriptors});
             const auto storageTableDescriptors = storageTableBindings[0] != std::numeric_limits<std::size_t>::max() ? bindings[storageTableBindings[0]].layout.descriptorCount : 0u;
@@ -2257,6 +2289,20 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
         }
     }
     updateAfterBind = updateAfterBind || tablesUpdateAfterBind;
+    std::array<std::uint32_t, 2> describedBuffers{};
+    for (std::size_t set = 0; set < descriptions.size(); ++set) {
+        for (const auto& binding : descriptions[set]) {
+            if (binding.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) describedBuffers[set] += binding.descriptorCount;
+        }
+    }
+    const bool graphics = std::none_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Compute; });
+    if (DynamicStorageBuffers(context, graphics, updateAfterBind, describedBuffers)) {
+        for (auto& set : descriptions) {
+            for (auto& binding : set) {
+                if (binding.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+            }
+        }
+    }
     for (std::size_t set = 0; set < descriptions.size(); ++set) {
         auto& key = set == 0 ? result.mainKey : result.fragmentKey;
         for (const auto& binding : descriptions[set]) key.insert(key.end(), {binding.binding, static_cast<std::uint32_t>(binding.descriptorType), binding.descriptorCount, binding.stageFlags});
@@ -2306,7 +2352,7 @@ void ShaderResources::buildComplete() {
             std::size_t imageCount = 0;
             for (const auto& binding : bindings) {
                 bufferCount += binding.allocations.size();
-                if (binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) imageCount += binding.flags != 0 ? binding.imageAllocations.size() : binding.layout.descriptorCount;
+                if (!IsStorageBuffer(binding.layout.descriptorType)) imageCount += binding.flags != 0 ? binding.imageAllocations.size() : binding.layout.descriptorCount;
             }
             auto& buffers = descriptorBuffers;
             auto& images = descriptorImages;
@@ -2373,9 +2419,11 @@ void ShaderResources::buildComplete() {
                 write.descriptorType = binding.layout.descriptorType;
                 switch (binding.layout.descriptorType) {
                     case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
                         write.pBufferInfo = buffers.data() + buffers.size();
-                        for (const auto index : binding.allocations) {
-                            buffers.push_back(descriptor(allocations[index]));
+                        for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+                            if (dynamicBuffers) dynamicElements[setOf(binding)].push_back({binding.layout.binding, static_cast<std::uint32_t>(element), binding.allocations[element], buffers.size()});
+                            buffers.push_back(descriptor(allocations[binding.allocations[element]]));
                         }
                         break;
                     case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
@@ -2403,6 +2451,10 @@ void ShaderResources::buildComplete() {
                     default: throw std::runtime_error("AGC graphics: ShaderResources encountered an unknown descriptor type while writing the descriptor set");
                 }
                 writes.push_back(write);
+            }
+            for (std::size_t set = 0; set < dynamicElements.size(); ++set) {
+                std::sort(dynamicElements[set].begin(), dynamicElements[set].end(), [](const DynamicElement& a, const DynamicElement& b) { return a.binding != b.binding ? a.binding < b.binding : a.element < b.element; });
+                zeroOffsets[set].assign(dynamicElements[set].size(), 0u);
             }
             if (keptWrites.empty()) {
                 context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
@@ -2922,12 +2974,141 @@ std::size_t ShaderResources::LookupLogCapacity() {
 // registry mutex), so the pending-image checks are skipped; otherwise one scan answers them for
 // every surface at once. The stamp checks go through one tracker lock, the cache checks through
 // the images' cached flags and one touch of the cache.
+namespace {
+
+struct RevalidateSplit {
+    std::atomic<std::uint64_t> calls{0}, direct{0}, described{0}, storage{0}, directNs{0}, describedNs{0}, storageNs{0}, restNs{0}, sameTracker{0}, sameEpoch{0}, samePending{0}, sameAll{0}, proofNs{0}, proofLoopNs{0}, proofEndNs{0}, proofs{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+RevalidateSplit& revalidateSplit() {
+    static RevalidateSplit split;
+    return split;
+}
+
+std::uint64_t RevalidateLapNs(std::chrono::steady_clock::time_point& mark) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count());
+    mark = now;
+    return spent;
+}
+
+void reportRevalidateSplit() {
+    auto& split = revalidateSplit();
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = split.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        split.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !split.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const auto calls = split.calls.exchange(0, std::memory_order_relaxed);
+    const auto per = [&](std::atomic<std::uint64_t>& slot) { return calls != 0 ? static_cast<double>(slot.exchange(0, std::memory_order_relaxed)) / static_cast<double>(calls) : 0.0; };
+    const auto direct = per(split.direct), described = per(split.described), storage = per(split.storage);
+    const auto directUs = per(split.directNs) / 1000.0, describedUs = per(split.describedNs) / 1000.0, storageUs = per(split.storageNs) / 1000.0, restUs = per(split.restNs) / 1000.0;
+    const auto sameTracker = split.sameTracker.exchange(0, std::memory_order_relaxed);
+    const auto sameEpoch = split.sameEpoch.exchange(0, std::memory_order_relaxed);
+    const auto samePending = split.samePending.exchange(0, std::memory_order_relaxed);
+    const auto sameAll = split.sameAll.exchange(0, std::memory_order_relaxed);
+    const auto share = [&](std::uint64_t value) { return calls != 0 ? 100.0 * static_cast<double>(value) / static_cast<double>(calls) : 0.0; };
+    std::fprintf(stderr, "[rescache] revalidate stamps unchanged since the template's last proof: tracker generation %.1f%%, collect epoch %.1f%%, pending serial %.1f%%, all three %.1f%%\n", share(sameTracker), share(sameEpoch), share(samePending), share(sameAll));
+    const auto proofs = split.proofs.exchange(0, std::memory_order_relaxed);
+    const auto proofUs = per(split.proofNs) / 1000.0;
+    const auto proofLoopUs = proofs != 0 ? static_cast<double>(split.proofLoopNs.exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(proofs) : 0.0;
+    const auto proofEndUs = proofs != 0 ? static_cast<double>(split.proofEndNs.exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(proofs) : 0.0;
+    std::fprintf(stderr, "[rescache] revalidate scoped (per call): fastRevalidate calls %.2f us (per completed proof: texture and storage checks %.2f us, final checks %.2f us); the rest of the old 'proof' figure is the code after the proof\n", proofUs, proofLoopUs, proofEndUs);
+    std::fprintf(stderr, "[rescache] revalidate split (10 s, %llu calls, per call): direct regions %.1f (%.2f us), described ranges %.1f (%.2f us), storage images %.1f (%.2f us), proof %.2f us\n", static_cast<unsigned long long>(calls), direct, directUs, described, describedUs, storage, storageUs, restUs);
+}
+
+}
+
+namespace {
+
+struct StampCounts {
+    std::atomic<std::uint64_t> calls{0}, answered{0}, saved{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+StampCounts& stampCounts() {
+    static StampCounts counts;
+    return counts;
+}
+
+void reportStampCounts() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& counts = stampCounts();
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counts.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        counts.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !counts.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const auto calls = counts.calls.exchange(0, std::memory_order_relaxed);
+    const auto answered = counts.answered.exchange(0, std::memory_order_relaxed);
+    const auto saved = counts.saved.exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[rescache] revalidate stamp (10 s): %llu fast proofs, %llu answered by the stamp (%.1f%%), %llu stamps saved\n", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(answered), calls != 0 ? 100.0 * static_cast<double>(answered) / static_cast<double>(calls) : 0.0, static_cast<unsigned long long>(saved));
+}
+
+}
+
+bool ShaderResources::stampedProofHolds(std::vector<const StorageTexture*>& images) {
+    images.clear();
+    if (validatedTextures.size() != textures.size()) return false;
+    for (std::size_t i = 0; i < textures.size(); ++i) {
+        const auto& surface = validatedTextures[i];
+        if (!surface.valid) return false;
+        if (surface.depth) {
+            if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return false;
+            continue;
+        }
+        if (textures[i]->Released()) return false;
+        if (!FlushDepthPlanes(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes)).empty()) return false;
+        if (surface.source != nullptr) {
+            if (!surface.source->Cached()) return false;
+            images.push_back(surface.source);
+        }
+    }
+    for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+        if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
+        const auto* image = storageTextures[i].get();
+        if (image == nullptr || !image->Cached()) return false;
+        if (DepthSurfaceOverlaps(context.device, image->Descriptor().baseAddress, image->GuestBytes())) return false;
+        images.push_back(image);
+    }
+    return StorageImagesCached(context, images);
+}
+
 bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted) {
     reason = FastFail::Count;
     overlapping.clear();
     accepted = false;
     if (!EpochRevalidate()) return fastRevalidateEach();
-    const auto fail = [&reason](FastFail why) {
+    static const bool stampSkip = [] {
+        const char* value = std::getenv("APS5_REVALIDATE_STAMP");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    static const bool verifyStamp = std::getenv("APS5_VERIFY_REVALIDATE_STAMP") != nullptr;
+    const std::array<std::uint64_t, 3> stamp{GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), serialBefore};
+    stampCounts().calls.fetch_add(1, std::memory_order_relaxed);
+    reportStampCounts();
+    bool stampAnswered = false;
+    if (stampSkip && stamp[0] != 0 && serialBefore != 0 && provedStamp == stamp) {
+        thread_local std::vector<const StorageTexture*>* stampImagesSlot = nullptr;
+        auto& stampImages = ShaderRecompiler::ThreadOwned(stampImagesSlot);
+        if (stampedProofHolds(stampImages)) {
+            stampCounts().answered.fetch_add(1, std::memory_order_relaxed);
+            if (!verifyStamp) {
+                for (const auto* image : stampImages) image->NoteProved();
+                return true;
+            }
+            stampAnswered = true;
+        }
+    }
+    provedStamp = {};
+    const auto fail = [&reason, stampAnswered](FastFail why) {
+        if (stampAnswered) throw std::runtime_error("APS5_VERIFY_REVALIDATE_STAMP: the stamp shortcut accepted a template the full proof refuses");
         reason = why;
         countFastFail(why);
         return false;
@@ -2955,6 +3136,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         pending.push_back({begin, end, except, identity, false});
         owners.push_back(owner);
     };
+    static const bool proofSplits = std::getenv("APS5_PROFILE_SPLITS") != nullptr;
+    auto proofSplitMark = proofSplits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (!surface.valid) return fail(FastFail::NoRecord);
@@ -3036,6 +3219,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         queries.push_back({address, bytes, image->Generation()});
         images.push_back(image);
     }
+    if (proofSplits) revalidateSplit().proofLoopNs.fetch_add(RevalidateLapNs(proofSplitMark), std::memory_order_relaxed);
     if (!pending.empty()) {
         if (!StorageTexture::ScanPending(pending)) return fail(FastFail::ClearedView);
         // A foreign image over a view under uncompressed keys is no failure while FindPending
@@ -3077,6 +3261,14 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         auto& surface = validatedTextures[i];
         if (surface.source == nullptr) surface.generation = surface.collected;
         surface.keys = scannedKeys[i];
+    }
+    if (proofSplits) {
+        revalidateSplit().proofEndNs.fetch_add(RevalidateLapNs(proofSplitMark), std::memory_order_relaxed);
+        revalidateSplit().proofs.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (overlapping.empty() && !accepted && GuestMemory::CollectEpoch() == stamp[1] && StorageTexture::PendingSerial() == serialBefore) {
+        provedStamp = {GuestMemory::TrackerGeneration(), stamp[1], serialBefore};
+        stampCounts().saved.fetch_add(1, std::memory_order_relaxed);
     }
     return true;
 }
@@ -3267,19 +3459,53 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    static const bool splits = std::getenv("APS5_PROFILE_SPLITS") != nullptr;
+    auto splitMark = splits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::array<std::uint64_t, 3> stampNow{};
+    if (splits) {
+        stampNow = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), StorageTexture::PendingSerial()};
+        thread_local std::unordered_map<const void*, std::array<std::uint64_t, 3>>* provedSlot = nullptr;
+        auto& proved = ShaderRecompiler::ThreadOwned(provedSlot);
+        if (const auto found = proved.find(this); found != proved.end()) {
+            auto& split = revalidateSplit();
+            const auto& was = found->second;
+            if (was[0] == stampNow[0]) split.sameTracker.fetch_add(1, std::memory_order_relaxed);
+            if (was[1] == stampNow[1]) split.sameEpoch.fetch_add(1, std::memory_order_relaxed);
+            if (was[2] == stampNow[2]) split.samePending.fetch_add(1, std::memory_order_relaxed);
+            if (was == stampNow) split.sameAll.fetch_add(1, std::memory_order_relaxed);
+        }
+        proved[this] = stampNow;
+        if (proved.size() > 65536) proved.clear();
+        auto& split = revalidateSplit();
+        split.calls.fetch_add(1, std::memory_order_relaxed);
+        split.direct.fetch_add(directRegions.size(), std::memory_order_relaxed);
+        split.described.fetch_add(describedRanges.size(), std::memory_order_relaxed);
+        split.storage.fetch_add(storageTextures.size(), std::memory_order_relaxed);
+        reportRevalidateSplit();
+    }
     for (const auto& region : directRegions) {
         static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
         CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     }
+    if (splits) revalidateSplit().directNs.fetch_add(RevalidateLapNs(splitMark), std::memory_order_relaxed);
     for (const auto& range : describedRanges) {
         if (!range.imageTable) RequireNoMultisampleColorTarget(range.address, static_cast<std::size_t>(range.bytes), "a cached image access");
         CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
         if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
     }
+    if (splits) revalidateSplit().describedNs.fetch_add(RevalidateLapNs(splitMark), std::memory_order_relaxed);
     for (const auto& image : storageTextures) {
         CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
+    if (splits) revalidateSplit().storageNs.fetch_add(RevalidateLapNs(splitMark), std::memory_order_relaxed);
+    struct RestTimer {
+        bool on;
+        std::chrono::steady_clock::time_point& mark;
+        ~RestTimer() {
+            if (on) revalidateSplit().restNs.fetch_add(RevalidateLapNs(mark), std::memory_order_relaxed);
+        }
+    } restTimer{splits, splitMark};
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
@@ -3380,7 +3606,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
+    auto proofMark = splits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    if (splits) revalidateSplit().proofNs.fetch_add(RevalidateLapNs(proofMark), std::memory_order_relaxed);
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
@@ -3395,7 +3623,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             fallback = refreshOwnObjects(shaders, refreshed);
         }
         if (fallback == OwnRefreshFallback::Count) {
+            proofMark = splits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+            if (splits) revalidateSplit().proofNs.fetch_add(RevalidateLapNs(proofMark), std::memory_order_relaxed);
             if (fast) ownRefreshed = true;
             else fallback = OwnRefreshFallback::Rerun;
         }
@@ -3604,15 +3834,16 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
 
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
+    const auto hash = KeyHash{}(key);
     std::lock_guard lock(mutex);
-    const auto found = index.find(key);
+    const auto found = index.find(HashedKey{key, hash});
     if (found == index.end()) {
         noteReturn(key);
         noteMiss(key);
         return nullptr;
     }
     entries.splice(entries.begin(), entries, found->second);
-    noteUse(key);
+    noteUse(hash);
     return found->second->second;
 }
 
@@ -3640,9 +3871,9 @@ void ResourceCache::noteEvicted(const Key& key) {
     std::fprintf(stderr, "[rescache] capacity %zu -> %zu entries: keys it evicted keep coming back\n", previous, capacity);
 }
 
-void ResourceCache::noteUse(const Key& key) {
+void ResourceCache::noteUse(std::size_t hash) {
     if (fixedCapacity || capacity <= baseEntries) return;
-    usedKeys.insert(KeyHash{}(key));
+    usedKeys.insert(hash);
     if (++usesSinceCheck < capacity * shrinkWindow) return;
     const auto used = usedKeys.size();
     const auto uses = usesSinceCheck;
@@ -3800,7 +4031,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         fixedCapacity = parsed != 0;
         capacity = fixedCapacity ? static_cast<std::size_t>(parsed) : baseEntries;
     }
-    noteUse(key);
+    noteUse(KeyHash{}(key));
     while (entries.size() > capacity) {
         noteEvicted(entries.back().first);
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
@@ -3860,11 +4091,12 @@ void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResou
 
 bool ResourceCache::Touch(const Key& key) {
     resourceCacheTouches.fetch_add(1, std::memory_order_relaxed);
+    const auto hash = KeyHash{}(key);
     std::lock_guard lock(mutex);
-    const auto found = index.find(key);
+    const auto found = index.find(HashedKey{key, hash});
     if (found == index.end()) return false;
     entries.splice(entries.begin(), entries, found->second);
-    noteUse(key);
+    noteUse(hash);
     return true;
 }
 
@@ -3992,6 +4224,7 @@ std::uint32_t SetDescriptorLimit(const Context& context, VkDescriptorType type, 
     const bool sampledUpdateAfterBind = updateAfterBind && context.sampledImageUpdateAfterBind;
     switch (type) {
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: return updateAfterBind ? indexed.maxDescriptorSetUpdateAfterBindStorageBuffers : limits.maxDescriptorSetStorageBuffers;
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return limits.maxDescriptorSetStorageBuffersDynamic;
         case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: return sampledUpdateAfterBind ? indexed.maxDescriptorSetUpdateAfterBindSampledImages : limits.maxDescriptorSetSampledImages;
         case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: return limits.maxDescriptorSetStorageImages;
         case VK_DESCRIPTOR_TYPE_SAMPLER: return sampledUpdateAfterBind ? indexed.maxDescriptorSetUpdateAfterBindSamplers : limits.maxDescriptorSetSamplers;
@@ -4001,8 +4234,8 @@ std::uint32_t SetDescriptorLimit(const Context& context, VkDescriptorType type, 
 
 // What one chain pool holds; a set needing more of any type gets a dedicated pool.
 constexpr std::uint32_t ChainPoolSets = 1024;
-constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
-constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolCreateSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 + 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
+constexpr std::array<VkDescriptorPoolSize, 5> ChainPoolSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 4096}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
+constexpr std::array<VkDescriptorPoolSize, 5> ChainPoolCreateSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 4096}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 + 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
 }
 
 DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount) {
@@ -5265,6 +5498,17 @@ bool ShaderResources::LayoutUpdateAfterBind() const {
     return updateAfterBind;
 }
 
+ShaderResources::DrawBindings::SharedSet::~SharedSet() {
+    if (cache == nullptr) return;
+    const auto release = [&](VkDescriptorSetLayout setLayout, const DescriptorCache::SetAllocation& set) {
+        if (set.set == VK_NULL_HANDLE) return;
+        if (setLayout != VK_NULL_HANDLE) cache->Recycle(setLayout, set);
+        else cache->Free(set);
+    };
+    release(layout, allocation);
+    release(fragmentLayout, fragmentAllocation);
+}
+
 ShaderResources::DrawBindings::~DrawBindings() {
     if (cache == nullptr) return;
     const auto release = [&](VkDescriptorSetLayout setLayout, const DescriptorCache::SetAllocation& set) {
@@ -5398,7 +5642,117 @@ std::size_t ShaderResources::DrawUploadLimit() {
     return limit;
 }
 
+namespace {
+
+struct BindingsSplit {
+    std::atomic<std::uint64_t> calls{0}, written{0}, writes{0}, snapshots{0}, repeatLast{0}, repeatRecent{0}, sameHandles{0}, sameHandlesSizes{0}, updateAfterBindSets{0}, overLimitSets{0}, eligibleSets{0}, eligibleRepeats{0}, eligibleBuffers{0}, sourceMoved{0}, sourceUnwritten{0}, sourceUpload{0}, sourceReused{0}, sourceFresh{0}, maxSelected{0}, dynamicLimit{0}, dynamicUniformLimit{0};
+    std::array<std::atomic<std::uint64_t>, 6> nanoseconds{};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+BindingsSplit& bindingsSplit() {
+    static BindingsSplit split;
+    return split;
+}
+
+struct BindingsLap {
+    bool profile;
+    std::chrono::steady_clock::time_point last = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    void operator()(std::size_t step) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        bindingsSplit().nanoseconds[step].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()), std::memory_order_relaxed);
+        last = now;
+    }
+};
+
+void reportBindingsSplit() {
+    auto& split = bindingsSplit();
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = split.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        split.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !split.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const auto calls = split.calls.exchange(0, std::memory_order_relaxed);
+    const auto written = split.written.exchange(0, std::memory_order_relaxed);
+    const auto writes = split.writes.exchange(0, std::memory_order_relaxed);
+    const auto snapshots = split.snapshots.exchange(0, std::memory_order_relaxed);
+    const auto repeatLast = split.repeatLast.exchange(0, std::memory_order_relaxed);
+    const auto repeatRecent = split.repeatRecent.exchange(0, std::memory_order_relaxed);
+    std::array<double, 6> us{};
+    for (std::size_t step = 0; step < us.size(); ++step) us[step] = calls != 0 ? static_cast<double>(split.nanoseconds[step].exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(calls) : 0.0;
+    std::fprintf(stderr, "[bindings] draw bindings (10 s): %llu calls, %llu with a new set (%.1f writes and %.1f snapshots each), us per call: snapshots %.2f, pool sizes %.2f, set allocation %.2f, write copy %.2f, vkUpdateDescriptorSets %.2f, keep %.2f\n", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(written), written != 0 ? static_cast<double>(writes) / static_cast<double>(written) : 0.0, written != 0 ? static_cast<double>(snapshots) / static_cast<double>(written) : 0.0, us[0], us[1], us[2], us[3], us[4], us[5]);
+    const auto sameHandles = split.sameHandles.exchange(0, std::memory_order_relaxed);
+    const auto sameHandlesSizes = split.sameHandlesSizes.exchange(0, std::memory_order_relaxed);
+    const auto updateAfterBindSets = split.updateAfterBindSets.exchange(0, std::memory_order_relaxed);
+    const auto overLimitSets = split.overLimitSets.exchange(0, std::memory_order_relaxed);
+    const auto eligibleSets = split.eligibleSets.exchange(0, std::memory_order_relaxed);
+    const auto eligibleRepeats = split.eligibleRepeats.exchange(0, std::memory_order_relaxed);
+    const auto eligibleBuffers = split.eligibleBuffers.exchange(0, std::memory_order_relaxed);
+    const auto pct = [&](std::uint64_t value) { return written != 0 ? 100.0 * static_cast<double>(value) / static_cast<double>(written) : 0.0; };
+    std::fprintf(stderr, "[bindings] dynamic offsets: templates with update-after-bind %.1f%%, over the dynamic limit %.1f%%, eligible %.1f%% (%.1f storage buffers each), eligible and same buffers and sizes %.1f%%\n", pct(updateAfterBindSets), pct(overLimitSets), pct(eligibleSets), eligibleSets != 0 ? static_cast<double>(eligibleBuffers) / static_cast<double>(eligibleSets) : 0.0, pct(eligibleRepeats));
+    std::fprintf(stderr, "[bindings] same snapshot buffers and sizes as the template's last draw (offsets may differ): %llu (%.1f%%)\n", static_cast<unsigned long long>(sameHandlesSizes), written != 0 ? 100.0 * static_cast<double>(sameHandlesSizes) / static_cast<double>(written) : 0.0);
+    const auto sourceMoved = split.sourceMoved.exchange(0, std::memory_order_relaxed);
+    const auto sourceUnwritten = split.sourceUnwritten.exchange(0, std::memory_order_relaxed);
+    const auto sourceUpload = split.sourceUpload.exchange(0, std::memory_order_relaxed);
+    const auto sourceReused = split.sourceReused.exchange(0, std::memory_order_relaxed);
+    const auto sourceFresh = split.sourceFresh.exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[bindings] same snapshot buffers as the template's last draw (offsets may differ): %llu (%.1f%%); snapshot sources: moved words %llu, unwritten fast path %llu, ring upload %llu, reused snapshot %llu, new buffer %llu; most snapshots in one set %llu; device dynamic storage buffers per set %llu, dynamic uniform buffers %llu\n", static_cast<unsigned long long>(sameHandles), written != 0 ? 100.0 * static_cast<double>(sameHandles) / static_cast<double>(written) : 0.0, static_cast<unsigned long long>(sourceMoved), static_cast<unsigned long long>(sourceUnwritten), static_cast<unsigned long long>(sourceUpload), static_cast<unsigned long long>(sourceReused), static_cast<unsigned long long>(sourceFresh), static_cast<unsigned long long>(split.maxSelected.load(std::memory_order_relaxed)), static_cast<unsigned long long>(split.dynamicLimit.load(std::memory_order_relaxed)), static_cast<unsigned long long>(split.dynamicUniformLimit.load(std::memory_order_relaxed)));
+    std::fprintf(stderr, "[bindings] same set as before for this template: last %llu (%.1f%%), one of the last 8 %llu (%.1f%%)\n", static_cast<unsigned long long>(repeatLast), written != 0 ? 100.0 * static_cast<double>(repeatLast) / static_cast<double>(written) : 0.0, static_cast<unsigned long long>(repeatRecent), written != 0 ? 100.0 * static_cast<double>(repeatRecent) / static_cast<double>(written) : 0.0);
+}
+
+void noteBindingsRepeat(const void* resources, std::span<const ShaderResources::DrawBindings::Snapshot> snapshots, bool eligible) {
+    std::uint64_t key = 1469598103934665603ull;
+    const auto mix = [&](std::uint64_t value) { key = (key ^ value) * 1099511628211ull; };
+    for (const auto& snapshot : snapshots) {
+        mix(reinterpret_cast<std::uint64_t>(snapshot.buffer.get()));
+        mix(snapshot.offset);
+        mix(snapshot.bytes);
+    }
+    std::uint64_t handles = 1469598103934665603ull;
+    std::uint64_t handlesSizes = 1469598103934665603ull;
+    for (const auto& snapshot : snapshots) {
+        handles = (handles ^ reinterpret_cast<std::uint64_t>(snapshot.buffer.get())) * 1099511628211ull;
+        handlesSizes = (handlesSizes ^ reinterpret_cast<std::uint64_t>(snapshot.buffer.get())) * 1099511628211ull;
+        handlesSizes = (handlesSizes ^ snapshot.bytes) * 1099511628211ull;
+    }
+    thread_local std::unordered_map<const void*, std::array<std::uint64_t, 11>>* recentSlot = nullptr;
+    auto& recent = ShaderRecompiler::ThreadOwned(recentSlot);
+    auto& entry = recent[resources];
+    auto& split = bindingsSplit();
+    if (entry[8] != 0 && entry[9] == handles) split.sameHandles.fetch_add(1, std::memory_order_relaxed);
+    if (entry[8] != 0 && entry[10] == handlesSizes) {
+        split.sameHandlesSizes.fetch_add(1, std::memory_order_relaxed);
+        if (eligible) split.eligibleRepeats.fetch_add(1, std::memory_order_relaxed);
+    }
+    entry[9] = handles;
+    entry[10] = handlesSizes;
+    auto most = split.maxSelected.load(std::memory_order_relaxed);
+    while (snapshots.size() > most && !split.maxSelected.compare_exchange_weak(most, snapshots.size(), std::memory_order_relaxed)) {}
+    if (entry[8] != 0 && entry[(entry[8] - 1) % 8] == key) split.repeatLast.fetch_add(1, std::memory_order_relaxed);
+    const auto filled = std::min<std::uint64_t>(entry[8], 8);
+    if (std::find(entry.begin(), entry.begin() + static_cast<std::ptrdiff_t>(filled), key) != entry.begin() + static_cast<std::ptrdiff_t>(filled)) split.repeatRecent.fetch_add(1, std::memory_order_relaxed);
+    entry[entry[8] % 8] = key;
+    ++entry[8];
+    if (recent.size() > 65536) recent.clear();
+}
+
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
+    static const bool profileSplit = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profileSplit) {
+        bindingsSplit().calls.fetch_add(1, std::memory_order_relaxed);
+        reportBindingsSplit();
+    }
+    BindingsLap lap{profileSplit};
+    static const bool splits = std::getenv("APS5_PROFILE_SPLITS") != nullptr;
+    if (splits && bindingsSplit().dynamicLimit.load(std::memory_order_relaxed) == 0) {
+        bindingsSplit().dynamicLimit.store(context.limits.maxDescriptorSetStorageBuffersDynamic, std::memory_order_relaxed);
+        bindingsSplit().dynamicUniformLimit.store(context.limits.maxDescriptorSetUniformBuffersDynamic, std::memory_order_relaxed);
+    }
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
@@ -5437,6 +5791,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             }
             selected.push_back(index);
             keep({0, std::move(buffer), 0, override->size});
+            if (splits) bindingsSplit().sourceMoved.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         std::uint64_t address = item.address;
@@ -5459,6 +5814,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         VkDeviceSize offset = 0;
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
+        if (splits && buffer != nullptr) bindingsSplit().sourceUnwritten.fetch_add(1, std::memory_order_relaxed);
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
         if (verifySnapshots && buffer != nullptr) {
             static std::atomic<std::uint64_t> checked{0}, differing{0};
@@ -5470,6 +5826,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         if (buffer == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
+            if (splits && uploaded) bindingsSplit().sourceUpload.fetch_add(1, std::memory_order_relaxed);
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
@@ -5478,6 +5835,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             } else {
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
                 buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+                if (splits) bindingsSplit().*(buffer != nullptr ? &BindingsSplit::sourceReused : &BindingsSplit::sourceFresh) += 1;
                 if (buffer == nullptr) {
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
@@ -5492,6 +5850,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
+    lap(0);
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<bool, 2> described{};
@@ -5511,6 +5870,62 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
     const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
+    lap(1);
+    thread_local std::vector<std::uint64_t>* dynamicKeySlot = nullptr;
+    auto& dynamicKey = ShaderRecompiler::ThreadOwned(dynamicKeySlot);
+    thread_local std::vector<const std::shared_ptr<Buffer>*>* dynamicBuffersSlot = nullptr;
+    auto& dynamicSnapshotBuffers = ShaderRecompiler::ThreadOwned(dynamicBuffersSlot);
+    if (dynamicBuffers) {
+        thread_local std::vector<std::size_t>* dynamicIndicesSlot = nullptr;
+        auto& indices = ShaderRecompiler::ThreadOwned(dynamicIndicesSlot);
+        indices.assign(allocations.size(), selected.size());
+        for (std::size_t index = 0; index < selected.size(); ++index) indices[selected[index]] = index;
+        dynamicKey.clear();
+        dynamicSnapshotBuffers.clear();
+        const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 1);
+        for (std::size_t set = 0; set < dynamicElements.size(); ++set) {
+            auto& offsets = result->dynamicOffsets[set];
+            offsets.clear();
+            for (const auto& element : dynamicElements[set]) {
+                const auto snapshotIndex = indices[element.allocation];
+                if (snapshotIndex == selected.size()) {
+                    const auto& info = descriptorBuffers[element.buffer];
+                    dynamicKey.insert(dynamicKey.end(), {reinterpret_cast<std::uint64_t>(info.buffer), info.offset, info.range, 0u});
+                    offsets.push_back(0u);
+                    continue;
+                }
+                const auto& snapshot = result->snapshots[snapshotIndex];
+                Require(snapshot.offset % alignment == 0 && snapshot.offset <= 0xffffffffull && snapshot.offset + snapshot.bytes <= snapshot.buffer->Bytes().size(), "a draw snapshot's dynamic offset is misaligned or outside its buffer");
+                dynamicKey.insert(dynamicKey.end(), {reinterpret_cast<std::uint64_t>(snapshot.buffer.get()), 0u, static_cast<std::uint64_t>(snapshot.bytes), 1u});
+                offsets.push_back(static_cast<std::uint32_t>(snapshot.offset));
+                dynamicSnapshotBuffers.push_back(&snapshot.buffer);
+            }
+        }
+        const auto& held = lastSharedSet;
+        bool reuse = held != nullptr && held->key == dynamicKey && held->snapshotBuffers.size() == dynamicSnapshotBuffers.size();
+        for (std::size_t index = 0; reuse && index < dynamicSnapshotBuffers.size(); ++index) {
+            const auto& weak = held->snapshotBuffers[index];
+            const auto& strong = *dynamicSnapshotBuffers[index];
+            reuse = !weak.expired() && !weak.owner_before(strong) && !strong.owner_before(weak);
+        }
+        if (reuse) {
+            static const bool verifyDynamic = std::getenv("APS5_VERIFY_DYNAMIC_SNAPSHOTS") != nullptr;
+            if (verifyDynamic) {
+                for (std::size_t set = 0; set < dynamicElements.size(); ++set) {
+                    for (std::size_t index = 0; index < dynamicElements[set].size(); ++index) {
+                        const auto snapshotIndex = indices[dynamicElements[set][index].allocation];
+                        if (snapshotIndex == selected.size()) Require(result->dynamicOffsets[set][index] == 0u, "APS5_VERIFY_DYNAMIC_SNAPSHOTS: a template element got a dynamic offset");
+                        else Require(result->dynamicOffsets[set][index] == result->snapshots[snapshotIndex].offset, "APS5_VERIFY_DYNAMIC_SNAPSHOTS: a snapshot element's dynamic offset differs from its snapshot");
+                    }
+                }
+                Require((held->allocation.set != VK_NULL_HANDLE) == (described[0] || splitSets) && (held->fragmentAllocation.set != VK_NULL_HANDLE) == (described[1] || splitSets), "APS5_VERIFY_DYNAMIC_SNAPSHOTS: a reused set does not cover the draw's sets");
+            }
+            result->shared = held;
+            recorder.Keep(result);
+            for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+            return result;
+        }
+    }
     result->cache = context.descriptorCache;
     if (described[0] || splitSets) {
         result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
@@ -5522,6 +5937,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         result->fragmentLayout = fragment.layout;
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
+    lap(2);
     thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
     auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
     buffers = descriptorBuffers;
@@ -5545,20 +5961,59 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
                 if (snapshotIndex == selected.size()) continue;
                 const auto& snapshot = result->snapshots[snapshotIndex];
-                buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
+                buffers[offset + element] = {snapshot.buffer->Handle(), dynamicBuffers ? VkDeviceSize{0} : snapshot.offset, snapshot.bytes};
             }
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
+    lap(3);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    lap(4);
+    if (dynamicBuffers) {
+        auto shared = std::make_shared<DrawBindings::SharedSet>();
+        shared->cache = std::exchange(result->cache, nullptr);
+        shared->layout = result->layout;
+        shared->fragmentLayout = result->fragmentLayout;
+        shared->allocation = std::exchange(result->allocation, {});
+        shared->fragmentAllocation = std::exchange(result->fragmentAllocation, {});
+        shared->key = dynamicKey;
+        shared->snapshotBuffers.reserve(dynamicSnapshotBuffers.size());
+        for (const auto* buffer : dynamicSnapshotBuffers) shared->snapshotBuffers.emplace_back(*buffer);
+        result->shared = shared;
+        lastSharedSet = std::move(shared);
+    }
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    lap(5);
+    if (profileSplit) {
+        auto& split = bindingsSplit();
+        split.written.fetch_add(1, std::memory_order_relaxed);
+        split.writes.fetch_add(writes.size(), std::memory_order_relaxed);
+        split.snapshots.fetch_add(result->snapshots.size(), std::memory_order_relaxed);
+        if (splits) {
+            std::array<std::uint32_t, 2> buffers{};
+            for (const auto& binding : bindings) {
+                if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) buffers[setOf(binding)] += binding.layout.descriptorCount;
+            }
+            const auto most = std::max(buffers[0], buffers[1]);
+            auto& counts = bindingsSplit();
+            const bool overLimit = most > context.limits.maxDescriptorSetStorageBuffersDynamic;
+            const bool eligible = !updateAfterBind && !overLimit;
+            if (updateAfterBind) counts.updateAfterBindSets.fetch_add(1, std::memory_order_relaxed);
+            if (overLimit) counts.overLimitSets.fetch_add(1, std::memory_order_relaxed);
+            if (eligible) {
+                counts.eligibleSets.fetch_add(1, std::memory_order_relaxed);
+                counts.eligibleBuffers.fetch_add(buffers[0] + buffers[1], std::memory_order_relaxed);
+            }
+            noteBindingsRepeat(this, result->snapshots, eligible);
+        }
+    }
     return result;
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
-    if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
-    if (fragment.set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, 0, nullptr);
+    if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, static_cast<std::uint32_t>(zeroOffsets[0].size()), zeroOffsets[0].data());
+    if (fragment.set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, static_cast<std::uint32_t>(zeroOffsets[1].size()), zeroOffsets[1].data());
 }
 
 namespace {

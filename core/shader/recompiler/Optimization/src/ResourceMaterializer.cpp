@@ -1512,6 +1512,77 @@ void materializeSrtGuards(const IrResourcePlan& plan, ResourceSnapshot& snapshot
     }
 }
 
+std::optional<std::uint32_t> directUserWord(const IrResourcePlan& plan, const IrValue* value, std::uint64_t& indirect) {
+    if (value == nullptr) return std::nullopt;
+    value = value->Resolve();
+    if (value->Opcode() != IrOpcode::GetUserData || value->ArgumentCount() == 0 || value->Argument(0) == nullptr) return std::nullopt;
+    const auto reg = RegIndex(static_cast<ScalarReg>(value->Argument(0)->Resolve()->Register().index));
+    if (reg < plan.userDataBase || reg - plan.userDataBase >= SrtUserDataUse::TrackedWords) {
+        indirect = ~std::uint64_t{0};
+        return std::nullopt;
+    }
+    return reg - plan.userDataBase;
+}
+
+std::shared_ptr<const DirectUserWordPlan> analyzeDirectUserWords(const IrResourcePlan& plan) {
+    auto result = std::make_shared<DirectUserWordPlan>();
+    if (!plan.denseValueIds || !plan.srtPlanComplete || plan.valueStorage.Size() == 0) return result;
+    std::uint64_t indirect = 0;
+    const auto markIndirect = [&](const IrValue* value) {
+        if (const auto word = directUserWord(plan, value, indirect)) indirect |= std::uint64_t{1} << *word;
+    };
+    for (const auto& value : plan.valueStorage) {
+        if (value.Resolve() != &value) continue;
+        if (value.Opcode() == IrOpcode::GetUserData) continue;
+        for (std::size_t index = 0; index < value.ArgumentCount(); ++index) markIndirect(value.Argument(index));
+    }
+    for (const auto& read : plan.srtReads) markIndirect(read.value);
+    for (const auto& block : plan.controlFlow) markIndirect(block.condition);
+    for (const auto* value : plan.uniformFill.values) markIndirect(value);
+    std::vector<std::uint8_t> tableSources(plan.descriptorSources.size(), 0u);
+    for (const auto& image : plan.info.images) {
+        if (image.table != NoTable && image.source < tableSources.size()) tableSources[image.source] = 1u;
+    }
+    for (const auto& sampler : plan.info.samplers) {
+        if (sampler.table != NoTable && sampler.source < tableSources.size()) tableSources[sampler.source] = 1u;
+    }
+    std::vector<std::uint8_t> materialized(plan.descriptorSources.size(), 0u);
+    for (const auto source : plan.materializationSources) {
+        if (source < materialized.size()) materialized[source] = 1u;
+    }
+    for (std::uint32_t source = 0; source < plan.descriptorSources.size(); ++source) {
+        if (materialized[source] != 0u && tableSources[source] == 0u) continue;
+        for (const auto* dword : plan.descriptorSources[source].dwords) markIndirect(dword);
+    }
+    std::vector<std::pair<DirectTarget, std::uint32_t>> targets;
+    for (std::uint32_t i = 0; i < plan.info.buffers.size(); ++i) targets.emplace_back(DirectTarget::Buffer, i);
+    for (std::uint32_t i = 0; i < plan.info.images.size(); ++i) {
+        if (plan.info.images[i].table == NoTable) targets.emplace_back(DirectTarget::Image, i);
+    }
+    for (std::uint32_t i = 0; i < plan.info.samplers.size(); ++i) {
+        if (plan.info.samplers[i].table == NoTable) targets.emplace_back(DirectTarget::Sampler, i);
+    }
+    if (targets.size() != plan.materializationSources.size()) return result;
+    std::uint64_t direct = 0;
+    std::vector<DirectUserWordPatch> patches;
+    for (std::uint32_t value = 0; value < plan.materializationSources.size(); ++value) {
+        const auto source = plan.materializationSources[value];
+        if (source >= plan.descriptorSources.size() || tableSources[source] != 0u) continue;
+        const auto& dwords = plan.descriptorSources[source].dwords;
+        for (std::uint32_t dword = 0; dword < plan.descriptorSources[source].dwordCount && dword < dwords.size(); ++dword) {
+            const auto word = directUserWord(plan, dwords[dword], indirect);
+            if (!word) continue;
+            direct |= std::uint64_t{1} << *word;
+            patches.push_back({targets[value].first, targets[value].second, source, dword, *word});
+        }
+    }
+    result->rebindable = direct & ~indirect;
+    for (const auto& patch : patches) {
+        if ((result->rebindable >> patch.word & 1u) != 0u) result->patches.push_back(patch);
+    }
+    return result;
+}
+
 struct DecodeMemoKey {
     std::uint64_t artifact = 0;
     std::uint32_t resource = 0;
@@ -2324,6 +2395,17 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
 void ResourceMaterializer::CompactPlan(IrResourcePlan& plan) {
     plan.compact = {};
     buildCompactPlan(plan);
+}
+
+const DirectUserWordPlan& ResourceMaterializer::DirectUserWords(const IrResourcePlan& plan) {
+    static const DirectUserWordPlan none;
+    auto* slot = plan.directSlot.get();
+    if (slot == nullptr) return none;
+    if (!slot->ready.load(std::memory_order_acquire)) {
+        std::call_once(slot->once, [&] { slot->words = analyzeDirectUserWords(plan); });
+        slot->ready.store(true, std::memory_order_release);
+    }
+    return *static_cast<const DirectUserWordPlan*>(slot->words.get());
 }
 
 void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const {

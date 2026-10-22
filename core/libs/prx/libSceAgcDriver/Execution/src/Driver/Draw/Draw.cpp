@@ -9,6 +9,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <bit>
 #include <cstdlib>
 #include <cstdio>
@@ -16,9 +18,54 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+struct DecodeSplit {
+    std::atomic<std::uint64_t> draws{0}, refreshes{0}, refresh{0}, resolve{0}, after{0}, vertex{0}, identity{0}, registerKey{0}, find{0}, trace{0}, current{0}, copies{0}, decodes{0}, uncachedLayouts{0}, decodeNs{0}, layoutNs{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+DecodeSplit& decodeSplit() {
+    static DecodeSplit split;
+    return split;
+}
+
+std::uint64_t DecodeSinceNs(std::chrono::steady_clock::time_point& start) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+    start = now;
+    return spent;
+}
+
+void reportDecodeSplit() {
+    auto& split = decodeSplit();
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = split.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        split.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !split.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const auto draws = split.draws.exchange(0, std::memory_order_relaxed);
+    const auto refreshes = split.refreshes.exchange(0, std::memory_order_relaxed);
+    const auto us = [&](std::atomic<std::uint64_t>& slot) { return draws != 0 ? static_cast<double>(slot.exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(draws) : 0.0; };
+    const auto refresh = us(split.refresh), resolve = us(split.resolve), after = us(split.after), vertex = us(split.vertex);
+    const auto identity = us(split.identity), registerKey = us(split.registerKey), find = us(split.find), trace = us(split.trace), current = us(split.current);
+    const auto copies = split.copies.exchange(0, std::memory_order_relaxed);
+    const auto decodes = split.decodes.exchange(0, std::memory_order_relaxed);
+    const auto uncachedLayouts = split.uncachedLayouts.exchange(0, std::memory_order_relaxed);
+    const auto decodeUs = us(split.decodeNs), layoutUs = us(split.layoutNs);
+    std::fprintf(stderr, "[draw] vertex stage infos (10 s): %llu copied from a variant, %llu decoded (%llu with an uncached position export scan); us per draw: DecodeVertexStageInfo %.2f, PositionExportLayout %.2f\n", static_cast<unsigned long long>(copies), static_cast<unsigned long long>(decodes), static_cast<unsigned long long>(uncachedLayouts), decodeUs, layoutUs);
+    std::fprintf(stderr, "[draw] key split (10 s, us per draw): identity key and relocation %.2f, register key %.2f, lock and find %.2f, trace only %.2f, programs current %.2f\n", identity, registerKey, find, trace, current);
+    std::fprintf(stderr, "[draw] decode split (10 s, %llu draws, %llu data-entry refreshes, us per draw): refresh copy and user words %.2f, resolve decode %.2f, programs and pixel %.2f, vertex stage infos %.2f\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(refreshes), refresh, resolve, after, vertex);
+}
+
+}
+
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool splits = std::getenv("APS5_PROFILE_SPLITS") != nullptr;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::uint64_t captures = 0;
     auto phaseLap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -92,6 +139,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<DrawUserPatch> userPatches;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        auto keyMark = keyStart;
         std::shared_ptr<const DrawRelocation> relocation;
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
@@ -106,7 +154,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 aliasFirst = relocation != nullptr && trial.productive;
             }
         }
+        if (splits) decodeSplit().identity.fetch_add(DecodeSinceNs(keyMark), std::memory_order_relaxed);
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
+        if (splits) decodeSplit().registerKey.fetch_add(DecodeSinceNs(keyMark), std::memory_order_relaxed);
         std::unique_lock cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -148,13 +198,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (dataEntry != nullptr) ++drawEntryCounters.dataHits;
             }
         }
+        if (splits) decodeSplit().find.fetch_add(DecodeSinceNs(keyMark), std::memory_order_relaxed);
         if (traceDrawCache()) traceDrawKeyLookup(drawKeyComponents, found == drawCache.end());
         if (traceDrawCache()) {
             traceInsert(traceKeysSeen, drawKey);
             traceInsert(traceShapes, shapeKey);
         }
         maybeReportDrawCache(profile);
+        if (splits) decodeSplit().trace.fetch_add(DecodeSinceNs(keyMark), std::memory_order_relaxed);
     }
+    auto currentMark = splits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
         userPatches.clear();
         std::lock_guard cacheLock(drawCacheMutex);
@@ -164,9 +217,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         decode = nullptr;
     }
     if (dataEntry != nullptr && !DecodeProgramsCurrent(*dataEntry->decode, *submission.shaders)) dataEntry = nullptr;
-    phaseTiming.Phase(DrawRowKeyLookupValidate);
+    if (splits) decodeSplit().current.fetch_add(DecodeSinceNs(currentMark), std::memory_order_relaxed);
+    phaseTiming.Phase(DrawRowKeyLookup);
+    auto decodeMark = splits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (splits) {
+        decodeSplit().draws.fetch_add(1, std::memory_order_relaxed);
+        reportDecodeSplit();
+    }
 
     if (dataEntry != nullptr) {
+        if (splits) decodeSplit().refreshes.fetch_add(1, std::memory_order_relaxed);
         auto refreshed = std::make_shared<DrawDecode>(*dataEntry->decode);
         for (auto& program : refreshed->programs) {
             ReadUserWords(queue, program, false);
@@ -184,7 +244,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         decode = std::move(refreshed);
     }
+    if (splits) decodeSplit().refresh.fetch_add(DecodeSinceNs(decodeMark), std::memory_order_relaxed);
     resolveDrawDecode(queue, submission, localDevice->graphicsContext(), decode, registerKey, drawKey, profile);
+    if (splits) decodeSplit().resolve.fetch_add(DecodeSinceNs(decodeMark), std::memory_order_relaxed);
     const auto& graphics = decode->state;
     auto pixel = decode->pixel;
     const bool writesPrograms = graphics.stages.mesh || drawParameters.indirect || !userPatches.empty();
@@ -213,6 +275,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto line = FormatDrawProgramTrace(submission.serial, submission.queue, identities);
         std::fprintf(stderr, "%s\n", line.c_str());
     }
+    if (splits) decodeSplit().after.fetch_add(DecodeSinceNs(decodeMark), std::memory_order_relaxed);
     phaseTiming.Phase(DrawRowDecode);
 
     const auto locate = [&](std::uint32_t location) -> std::optional<std::pair<std::size_t, std::size_t>> {
@@ -249,8 +312,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& program = programs[i];
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         decodeReads[i].clear();
+        auto decodeStarted = splits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
+        if (splits) {
+            decodeSplit().decodes.fetch_add(1, std::memory_order_relaxed);
+            decodeSplit().decodeNs.fetch_add(DecodeSinceNs(decodeStarted), std::memory_order_relaxed);
+            if (vertexInfos[i] && !(program.snapshot != nullptr && program.codeOffset == 0)) decodeSplit().uncachedLayouts.fetch_add(1, std::memory_order_relaxed);
+        }
         if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, readRegister(queue.context, 0x207), program.tailContinuation.get()) | graphics.layerExports;
+        if (splits) decodeSplit().layoutNs.fetch_add(DecodeSinceNs(decodeStarted), std::memory_order_relaxed);
         if (vertexInfos[i]) {
             vertexInfos[i]->depthRemapMode = graphics.depthRemap.mode;
         }
@@ -280,11 +350,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<std::vector<std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>>> dataCandidates(programs.size());
     std::vector<bool> reused(programs.size(), false);
     std::vector<StageDataHit> stageData(programs.size());
+    std::vector<std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>> sharedCandidates(programs.size());
     std::uint64_t dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
     bool drawHit = false;
     bool verifyHit = false;
     const bool stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
-    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData);
+    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, sharedCandidates);
     for (std::size_t i = 0; i < matched.size(); ++i) {
         if (matched[i] == nullptr || matched[i]->shaderDataPatches.empty()) continue;
         applyShaderDataPatches(*matched[i]);
@@ -308,15 +379,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::uint64_t stageDataVerified = 0;
 
     if (registerKey) {
-
+        auto vertexMark = splits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         for (std::size_t i = 0; i < programs.size(); ++i) {
             if (matched[i] != nullptr && drawHit && !verifyDrawRecipe()) {
                 if (matched[i]->vertexInfo != nullptr) vertexInfos[i] = *matched[i]->vertexInfo;
+                if (splits) decodeSplit().copies.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             if (!dataCandidates[i].empty() && !verifyDrawDataHits()) {
                 const auto& info = dataCandidates[i].front().first->vertexInfo;
                 if (info != nullptr) vertexInfos[i] = *info;
+                if (splits) decodeSplit().copies.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             decodeVertexInfo(i);
@@ -327,6 +400,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 ++drawEntryCounters.verifyDecodeMismatches;
             }
         }
+        if (splits) decodeSplit().vertex.fetch_add(DecodeSinceNs(vertexMark), std::memory_order_relaxed);
         phaseTiming.Phase(DrawRowDecode);
     }
 
@@ -387,11 +461,22 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             const auto candidate = std::find_if(dataCandidates[i].begin(), dataCandidates[i].end(), [&](const auto& kept) { return kept.first->pushOffset == pushCursorBytes; });
+            std::shared_ptr<const ShaderRecompiler::RecompileResult> shared;
+            StageCapture sharedCheck;
+            if (candidate == dataCandidates[i].end() && sharedCandidates[i].first != nullptr) phaseTiming.Phase(DrawRowVectors);
+            if (candidate == dataCandidates[i].end() && sharedCandidates[i].first != nullptr) shared = shareDrawStage(*sharedCandidates[i].first, sharedCandidates[i].second, program, vertexInfos[i], pushCursorBytes, verifyDrawDataHits() ? sharedCheck : stageCaptures[i]);
+            if (shared != nullptr) phaseTiming.Phase(DrawRowSharedCopy);
             if (candidate != dataCandidates[i].end() && !verifyDrawDataHits()) {
                 matched[i] = candidate->first;
                 matchedRegions[i] = std::move(candidate->second);
                 reused[i] = true;
                 programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
+                memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
+            } else if (shared != nullptr && !verifyDrawDataHits()) {
+                matched[i] = sharedCandidates[i].first;
+                matchedRegions[i] = std::move(sharedCandidates[i].second);
+                compiledStages.push_back(shared);
+                programResults[i] = shared.get();
                 memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
             } else {
                 if (!dataCandidates[i].empty() && !verifyDrawDataHits()) decodeVertexInfo(i);
@@ -406,6 +491,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 programResults[i] = compiledStages.back().get();
                 if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
+                if (shared != nullptr) verifySharedStage(i, program.binary.codeAddress, *sharedCandidates[i].first, *shared, *programResults[i]);
                 if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
             }
             if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
@@ -600,9 +686,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 const auto commitQueue = submission.queue;
                 const auto commitPacket = (packet[0] >> 8u) & 0xffu;
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-                auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+                auto earlyKey = Graphics::BuildEarlyDrawKey(localDevice->Device(), decode->state, stages);
+                auto commit = [this, earlyKey = std::move(earlyKey), localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
                     DrawPipeline::FollowEpoch(epoch);
                     GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+                    const Graphics::EarlyDrawKeyScope early(earlyKey, decode->state, stages);
                     commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0);
                 };
                 auto held = std::make_shared<decltype(commit)>(std::move(commit));
@@ -641,17 +729,23 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (pipelined && !drawParameters.indirect && deferredLabels().labels.empty()) {
         phaseTiming.Phase(DrawRowVectors);
+        phaseTiming.Phase(DrawRowEnqueuePrior);
         auto writes = drawWriteRanges(graphics, stages);
+        phaseTiming.Phase(DrawRowEnqueueWrites);
         const auto commitQueue = submission.queue;
         const auto commitPacket = (packet[0] >> 8u) & 0xffu;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+        phaseTiming.Phase(DrawRowEnqueueReads);
+        auto earlyKey = Graphics::BuildEarlyDrawKey(localDevice->Device(), decode->state, stages);
+        auto commit = [this, earlyKey = std::move(earlyKey), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+            const Graphics::EarlyDrawKeyScope early(earlyKey, decode->state, stages);
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
+        phaseTiming.Phase(DrawRowEnqueueClosure);
         DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");

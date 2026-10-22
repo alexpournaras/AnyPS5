@@ -1,6 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include <algorithm>
 #include <cstdlib>
+#include <functional>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -35,8 +40,27 @@ void Driver::reportDrawCache(DrawEntryCounters& counters, bool profile) {
         text += line;
         std::snprintf(line, sizeof(line), "[draw-cache] register-key miss component changes (10 s): stable registers %llu, user data %llu, auxiliary registers %llu, device %llu, first shader set %llu, unchanged components %llu\n", count(counters.registerKeyMissChanges[0]), count(counters.registerKeyMissChanges[1]), count(counters.registerKeyMissChanges[2]), count(counters.registerKeyMissChanges[3]), count(counters.registerKeyMissChanges[4]), count(counters.registerKeyMissChanges[5]));
         text += line;
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> ranked;
+        ranked.reserve(counters.dataWordChanges.size());
+        for (const auto& [word, changes] : counters.dataWordChanges) ranked.emplace_back(changes, word);
+        std::sort(ranked.begin(), ranked.end(), std::greater<>());
+        static constexpr const char* uses[] = {"value", "pointer", "register", "fetch", "beyond 64", "unwalked"};
+        std::string words;
+        for (std::size_t k = 0; k < ranked.size() && k < 16; ++k) {
+            char item[64];
+            const auto word = ranked[k].second;
+            std::snprintf(item, sizeof(item), "%sstage %u word %u %s %llu", k == 0 ? "" : ", ", word >> 16u, word & 0xffu, uses[std::min<std::uint32_t>(word >> 8u & 0xffu, 5)], count(ranked[k].first));
+            words += item;
+        }
+        std::snprintf(line, sizeof(line), "[draw-cache] data-only stage misses (10 s): draws off the vertex path %llu, user word counts differ %llu, a used word differs %llu, used words equal but memory or push offset differs %llu, no variant %llu; changed used words (%zu distinct): %s\n", count(counters.dataStageMisses[0]), count(counters.dataStageMisses[1]), count(counters.dataStageMisses[2]), count(counters.dataStageMisses[3]), count(counters.dataStageMisses[4]), ranked.size(), words.c_str());
+        text += line;
     }
-    if (profile) text += profileDrawCacheLines(counters);
+    if (drawShared()) {
+        char line[512];
+        std::snprintf(line, sizeof(line), "[draw-cache] shared stages (10 s): %llu built from a kept stage without a walk or a build; refused: push offset %llu, vertex formats %llu, descriptor shape %llu; %llu verified against a full build\n", count(counters.sharedStages), count(counters.sharedPushOffset), count(counters.sharedVertexShape), count(counters.sharedDescriptorShape), count(counters.sharedVerified));
+        text += line;
+    }
+    if (profile) text += profileDrawCacheLines(counters) + validateSplitReport();
     AgcDriver::ProfilePrint_nid_no_patch("%s", text.c_str());
     counters = DrawEntryCounters{};
 }

@@ -187,12 +187,29 @@ public:
             std::size_t bytes = 0;
             std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
         };
+        struct SharedSet {
+            SharedSet() = default;
+            SharedSet(const SharedSet&) = delete;
+            SharedSet& operator=(const SharedSet&) = delete;
+            DescriptorCache* cache = nullptr;
+            VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+            VkDescriptorSetLayout fragmentLayout = VK_NULL_HANDLE;
+            DescriptorCache::SetAllocation fragmentAllocation;
+            DescriptorCache::SetAllocation allocation;
+            std::vector<std::uint64_t> key;
+            std::vector<std::weak_ptr<Buffer>> snapshotBuffers;
+            ~SharedSet();
+        };
         DescriptorCache* cache = nullptr;
         VkDescriptorSetLayout layout = VK_NULL_HANDLE;
         VkDescriptorSetLayout fragmentLayout = VK_NULL_HANDLE;
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        std::shared_ptr<SharedSet> shared;
+        std::array<std::vector<std::uint32_t>, 2> dynamicOffsets;
+        VkDescriptorSet Set() const { return shared != nullptr ? shared->allocation.set : allocation.set; }
+        VkDescriptorSet FragmentSet() const { return shared != nullptr ? shared->fragmentAllocation.set : fragmentAllocation.set; }
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -567,6 +584,16 @@ private:
         DescriptorCache::SetAllocation cacheAllocation;
     };
     bool splitSets = false;
+    struct DynamicElement {
+        std::uint32_t binding = 0;
+        std::uint32_t element = 0;
+        std::size_t allocation = 0;
+        std::size_t buffer = 0;
+    };
+    bool dynamicBuffers = false;
+    std::array<std::vector<DynamicElement>, 2> dynamicElements;
+    std::array<std::vector<std::uint32_t>, 2> zeroOffsets;
+    mutable std::shared_ptr<DrawBindings::SharedSet> lastSharedSet;
     std::vector<std::uint32_t> fragmentLayoutKey;
     SetObjects fragment;
     struct TableWrites {
@@ -631,6 +658,8 @@ private:
     // no image other than the object's own sources has results pending over its surfaces and
     // regions, so those checks are skipped (see fastRevalidate).
     std::uint64_t pendingSerialSeen = 0;
+    std::array<std::uint64_t, 3> provedStamp{};
+    bool stampedProofHolds(std::vector<const StorageTexture*>& images);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
@@ -717,17 +746,47 @@ private:
     void dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteEvicted(const Key& key);
     void noteReturn(const Key& key);
-    void noteUse(const Key& key);
+    void noteUse(std::size_t hash);
+    struct HashedKey {
+        const Key& key;
+        std::size_t hash;
+    };
     struct KeyHash {
-        std::size_t operator()(const Key& key) const noexcept {
-            std::uint64_t hash = 14695981039346656037ull;
-            for (const auto word : key) hash = (hash ^ word) * 1099511628211ull;
+        using is_transparent = void;
+        static std::uint64_t Lane(std::uint64_t lane, std::uint64_t value) {
+            lane += value * 0xc2b2ae3d27d4eb4full;
+            lane = (lane << 31u) | (lane >> 33u);
+            return lane * 0x9e3779b185ebca87ull;
+        }
+        std::size_t operator()(const Key& key) const {
+            const auto* words = key.data();
+            const auto count = key.size();
+            std::array<std::uint64_t, 4> lanes{0x9e3779b185ebca87ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull};
+            std::size_t at = 0;
+            for (; at + 8 <= count; at += 8) {
+                for (std::size_t lane = 0; lane < lanes.size(); ++lane) lanes[lane] = Lane(lanes[lane], words[at + lane * 2] | (static_cast<std::uint64_t>(words[at + lane * 2 + 1]) << 32u));
+            }
+            std::uint64_t hash = count;
+            for (const auto lane : lanes) hash = (hash ^ Lane(0, lane)) * 0x9e3779b185ebca87ull + 0x85ebca77c2b2ae63ull;
+            for (; at < count; ++at) hash = Lane(hash, words[at]);
+            hash ^= hash >> 33u;
+            hash *= 0xff51afd7ed558ccdull;
+            hash ^= hash >> 33u;
+            hash *= 0xc4ceb9fe1a85ec53ull;
+            hash ^= hash >> 33u;
             return static_cast<std::size_t>(hash);
         }
+        std::size_t operator()(const HashedKey& key) const { return key.hash; }
+    };
+    struct KeyEqual {
+        using is_transparent = void;
+        bool operator()(const Key& first, const Key& second) const { return first == second; }
+        bool operator()(const HashedKey& first, const Key& second) const { return first.key == second; }
+        bool operator()(const Key& first, const HashedKey& second) const { return first == second.key; }
     };
     mutable std::mutex mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
-    std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    std::unordered_map<Key, decltype(entries)::iterator, KeyHash, KeyEqual> index;
     std::size_t capacity = 0;
     bool fixedCapacity = false;
     std::list<std::size_t> evictedOrder;

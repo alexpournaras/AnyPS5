@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <string_view>
@@ -830,8 +831,10 @@ namespace {
 template<typename TValue>
 void append(std::vector<std::byte>& key, const TValue& value) {
     static_assert(std::is_trivially_copyable_v<TValue>);
-    const auto bytes = std::as_bytes(std::span(&value, 1));
-    key.insert(key.end(), bytes.begin(), bytes.end());
+    const auto at = key.size();
+    if (key.capacity() - at < sizeof(TValue)) key.reserve(std::max<std::size_t>(key.capacity() * 2, at + sizeof(TValue) + 512));
+    key.resize(at + sizeof(TValue));
+    std::memcpy(key.data() + at, &value, sizeof(TValue));
 }
 
 // Everything the Pipeline objects are built from, or empty when a stage's result has no module
@@ -957,6 +960,34 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
     append(key, context.shaderStencilExport);
 }
 
+struct PipelineLookupSplit {
+    std::atomic<std::uint64_t> calls{0}, build{0}, hash{0}, find{0}, bytes{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+PipelineLookupSplit& pipelineLookupSplit() {
+    static PipelineLookupSplit split;
+    return split;
+}
+
+void reportPipelineLookupSplit(std::size_t keyBytes) {
+    auto& split = pipelineLookupSplit();
+    split.calls.fetch_add(1, std::memory_order_relaxed);
+    split.bytes.fetch_add(keyBytes, std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = split.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        split.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !split.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const auto calls = split.calls.exchange(0, std::memory_order_relaxed);
+    const auto us = [&](std::atomic<std::uint64_t>& slot) { return calls != 0 ? static_cast<double>(slot.exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(calls) : 0.0; };
+    const auto build = us(split.build), hash = us(split.hash), find = us(split.find);
+    const auto bytes = split.bytes.exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[pipelines] lookup split (10 s, %llu hits, %.0f key bytes, us per hit): key build %.2f, hash %.2f, locked find and compare %.2f\n", static_cast<unsigned long long>(calls), calls != 0 ? static_cast<double>(bytes) / static_cast<double>(calls) : 0.0, build, hash, find);
+}
+
 std::uint64_t hashKey(const std::vector<std::byte>& key) {
     return std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(key.data()), key.size()));
 }
@@ -1038,8 +1069,17 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
     struct PipelineKeyStorage {};
+    static const bool profile = std::getenv("APS5_PROFILE_SPLITS") != nullptr;
+    auto mark = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto lap = [&](std::atomic<std::uint64_t>& slot) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        slot.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count()), std::memory_order_relaxed);
+        mark = now;
+    };
     auto& key = HostThreadLocal<std::vector<std::byte>, PipelineKeyStorage>();
     pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    lap(pipelineLookupSplit().build);
     if (key.empty()) {
         std::lock_guard lock(store.mutex);
         ++store.uncached;
@@ -1047,6 +1087,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     }
     const auto hash = hashKey(key);
+    lap(pipelineLookupSplit().hash);
     // The store's entry of the key, or nullptr with `found` telling a miss (the key is new) from a
     // collision (another configuration owns the hash, so this one stays private).
     const auto lookup = [&](bool& collision) -> std::shared_ptr<Pipeline> {
@@ -1072,6 +1113,8 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         reportPipelines(store);
         bool collision = false;
         if (auto pipeline = lookup(collision)) {
+            lap(pipelineLookupSplit().find);
+            reportPipelineLookupSplit(key.size());
             ++store.hits;
             ++store.totals.hits;
             return pipeline;

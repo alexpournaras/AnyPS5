@@ -549,7 +549,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPl
     const bool hasSamplers = std::any_of(selected.bindings.begin(), selected.bindings.end(), [](const auto& binding) { return binding.descriptor.role == DescriptorRole::GuestSamplers; });
     if (!hasSamplers) {
         for (auto& binding : selected.bindings) {
-            std::fill(binding.descriptor.imageSamplers.begin(), binding.descriptor.imageSamplers.end(), 0u);
+            if (!binding.descriptor.imageSamplers.empty()) std::ranges::fill(binding.descriptor.imageSamplers.Edit(), 0u);
             binding.tableSamplerMasks.clear();
         }
     }

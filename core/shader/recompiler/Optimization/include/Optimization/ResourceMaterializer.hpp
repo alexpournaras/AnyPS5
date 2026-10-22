@@ -64,6 +64,21 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+enum class DirectTarget : std::uint8_t { Buffer, Image, Sampler };
+
+struct DirectUserWordPatch {
+    DirectTarget target = DirectTarget::Buffer;
+    std::uint32_t index = 0;
+    std::uint32_t source = 0;
+    std::uint32_t dword = 0;
+    std::uint32_t word = 0;
+};
+
+struct DirectUserWordPlan {
+    std::uint64_t rebindable = 0;
+    std::vector<DirectUserWordPatch> patches;
+};
+
 class ResourceMaterializer {
 public:
     static std::uint32_t EmulatedCompareState(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t index);
@@ -79,6 +94,7 @@ public:
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
     static void CompactPlan(IrResourcePlan& plan);
     void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const;
+    static const DirectUserWordPlan& DirectUserWords(const IrResourcePlan& plan);
     static std::uint64_t SpecializationNanoseconds();
     static ImageTableReuseCounts TableReuse();
     static std::uint64_t EvaluateNanoseconds();

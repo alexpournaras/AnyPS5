@@ -86,8 +86,8 @@ namespace ShaderRecompiler::ShaderDiskCache {
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(CompiledShaderArtifact) == 280, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 216, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 528, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 656, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(RecompileResult) == 544, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(DescriptorBinding) == 320, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
@@ -145,7 +145,7 @@ static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: upda
 static_assert(fieldCount<SampledResourcePair>() == 3, "SampledResourcePair changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
-static_assert(fieldCount<IrResourcePlan>() == 24, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(fieldCount<IrResourcePlan>() == 25, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 31, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
@@ -423,7 +423,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.imageDepthCompare);
     writer.Flags(binding.imageAtomic);
     writer.Flags(binding.imageAtomic64);
-    writer.List(binding.imageShapes, [](Writer& out, DescriptorImageShape shape) { out.Value(shape); });
+    writer.List(binding.imageShapes.Get(), [](Writer& out, DescriptorImageShape shape) { out.Value(shape); });
     writer.Flags(binding.bufferAtomic);
     writer.Flags(binding.bufferWritten);
     writer.Flags(binding.samplerUnnormalized);
@@ -447,22 +447,22 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     const bool hasShape = reader.Get<bool>();
     const auto shape = reader.Get<DescriptorImageShape>();
     binding.imageShape = hasShape ? std::optional(shape) : std::nullopt;
-    reader.Flags(binding.samplerDepthCompare);
-    reader.Flags(binding.imageWritten);
-    reader.Flags(binding.imageDepthCompare);
-    reader.Flags(binding.imageAtomic);
-    reader.Flags(binding.imageAtomic64);
-    reader.List(binding.imageShapes, 4, [](Reader& in, DescriptorImageShape& shape) { in.Value(shape); });
-    reader.Flags(binding.bufferAtomic);
-    reader.Flags(binding.bufferWritten);
-    reader.Flags(binding.samplerUnnormalized);
-    reader.Flags(binding.imageUnnormalized);
-    reader.Flags(binding.imageUnnormalizedBaseLevel);
-    reader.Flags(binding.samplerIntegerBorder);
-    reader.Flags(binding.samplerCoordinatesIgnored);
-    reader.Values(binding.imageSamplers);
-    reader.Flags(binding.bufferRead);
-    reader.Values(binding.bufferExtent);
+    reader.Flags(binding.samplerDepthCompare.Edit());
+    reader.Flags(binding.imageWritten.Edit());
+    reader.Flags(binding.imageDepthCompare.Edit());
+    reader.Flags(binding.imageAtomic.Edit());
+    reader.Flags(binding.imageAtomic64.Edit());
+    reader.List(binding.imageShapes.Edit(), 4, [](Reader& in, DescriptorImageShape& shape) { in.Value(shape); });
+    reader.Flags(binding.bufferAtomic.Edit());
+    reader.Flags(binding.bufferWritten.Edit());
+    reader.Flags(binding.samplerUnnormalized.Edit());
+    reader.Flags(binding.imageUnnormalized.Edit());
+    reader.Flags(binding.imageUnnormalizedBaseLevel.Edit());
+    reader.Flags(binding.samplerIntegerBorder.Edit());
+    reader.Flags(binding.samplerCoordinatesIgnored.Edit());
+    reader.Values(binding.imageSamplers.Edit());
+    reader.Flags(binding.bufferRead.Edit());
+    reader.Values(binding.bufferExtent.Edit());
 }
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {

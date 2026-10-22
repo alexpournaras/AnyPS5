@@ -271,6 +271,9 @@ function(add_shader_recompiler target runtimeTarget)
             ReleaseUndrawnResourcePlan
             ResourceMaterializer::SpecializationNanoseconds
             RuntimeAbi::RequireVersion
+            ValuePositions
+            ValueField
+            ValuePosition
             RuntimeAbi::HeapCapacity
             SampledTextureNumericClass
             SetDebugProbeActive
