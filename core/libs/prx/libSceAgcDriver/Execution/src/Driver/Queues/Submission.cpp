@@ -492,6 +492,7 @@ void Driver::enqueue(Submission submission) {
         std::snprintf(role, sizeof(role), "queue 0x%x worker", queue);
         try {
             RaiseWorkerThreadPriority(role);
+            if (queue == 0) PinDrawThread(role);
         } catch (...) {
             ReportFailure(std::current_exception());
             return;

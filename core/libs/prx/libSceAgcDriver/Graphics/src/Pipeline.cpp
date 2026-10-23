@@ -1063,9 +1063,10 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     return CachedPipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout);
 }
 
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool* created) {
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool* created, bool lookupOnly) {
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (created != nullptr) *created = false;
+    if (disabled && lookupOnly) return nullptr;
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
     struct PipelineKeyStorage {};
@@ -1080,6 +1081,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     auto& key = HostThreadLocal<std::vector<std::byte>, PipelineKeyStorage>();
     pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
     lap(pipelineLookupSplit().build);
+    if (key.empty() && lookupOnly) return nullptr;
     if (key.empty()) {
         std::lock_guard lock(store.mutex);
         ++store.uncached;
@@ -1119,6 +1121,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             ++store.totals.hits;
             return pipeline;
         }
+        if (lookupOnly) return nullptr;
         if (collision) {
             // A different configuration with the same hash keeps the resident entry; this one stays private.
             ++store.uncached;

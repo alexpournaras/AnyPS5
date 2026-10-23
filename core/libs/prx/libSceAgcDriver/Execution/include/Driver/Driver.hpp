@@ -174,7 +174,9 @@ private:
     static bool drawPrecheck();
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
-    DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
+    DrawVerdict draw(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
+    bool runDrawPacket(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t cursor);
+    void prepareDrawAhead(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint32_t opcode);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();

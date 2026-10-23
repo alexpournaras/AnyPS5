@@ -1148,6 +1148,9 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRec
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
+const EarlyDrawKey* PeekEarlyDrawKey(const State& state, std::span<const CompiledShader> shaders);
+bool SameVertexLayout(const VertexInputLayout& first, const VertexInputLayout& second);
+
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
@@ -1158,6 +1161,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     // read by the GPU from the host import or, when the GPU could not see their current bytes, by
     // the CPU (Draw's `records`). The driver resolved every non-vertex-path draw before this.
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
+    const auto* early = recipe == nullptr ? PeekEarlyDrawKey(state, shaders) : nullptr;
+    static const bool verifyEarly = std::getenv("APS5_VERIFY_DRAW_KEY") != nullptr;
     Require(draw.indexed ? draw.flags == 0 : (draw.flags & ~0x20u) == 0, "draw modifiers are unsupported");
     if (draw.indexed) {
         Require(draw.indexSize == 2 || draw.indexSize == 4, "only uint16 and uint32 index buffers are supported");
@@ -1190,6 +1195,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
         inputs.shaderStages = recipe->shaderStages;
+    } else if (early != nullptr && early->validated) {
+        inputs.fragmentOutputs = early->fragmentOutputs;
+        inputs.shaderStages = early->shaderStages;
+        if (verifyEarly) Require(CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit) == early->fragmentOutputs && PipelineStages(shaders) == early->shaderStages, "APS5_VERIFY_DRAW_KEY: the fragment outputs or pipeline stages found by the preparer differ from the committer's");
     } else {
         inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
         inputs.shaderStages = PipelineStages(shaders);
@@ -1217,9 +1226,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     }
     if (state.stages.tessellation) Require(draw.indexCount % state.stages.tessellation->inputControlPoints == 0, "incomplete tessellation patch");
     // Viewport and scissor are dynamic pipeline state, so their limits are checked here per draw.
-    ValidateViewport(context, state.viewport);
-    ValidateDepthBounds(context, state);
-    ValidateSampleMask(context, state, shaders);
+    if (early == nullptr || !early->validated || verifyEarly) {
+        ValidateViewport(context, state.viewport);
+        ValidateDepthBounds(context, state);
+        ValidateSampleMask(context, state, shaders);
+    }
     timer.phase(PhaseValidate);
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
     if (state.quadList) {
@@ -1367,6 +1378,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) {
         inputs.vertexInput = recipe->vertexInput;
+    } else if (!attributes.empty() && early != nullptr && early->vertexInput != nullptr) {
+        inputs.retainedVertexInput = early->vertexInput;
+        if (verifyEarly) Require(SameVertexLayout(*early->vertexInput, BuildVertexInputLayout(context, attributes)), "APS5_VERIFY_DRAW_KEY: the vertex input layout built by the preparer differs from the committer's");
     } else if (!attributes.empty()) {
         if (context.vertexInputs != nullptr) inputs.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
         if (inputs.retainedVertexInput == nullptr) inputs.vertexInput = BuildVertexInputLayout(context, attributes);
@@ -1522,12 +1536,44 @@ struct EarlyDrawKeySlot {
 
 thread_local EarlyDrawKeySlot earlyDrawKey;
 
+const EarlyDrawKey* PeekEarlyDrawKey(const State& state, std::span<const CompiledShader> shaders) {
+    const auto& slot = earlyDrawKey;
+    if (slot.key == nullptr || slot.state != &state || slot.shaders != shaders.data() || slot.count != shaders.size()) return nullptr;
+    return slot.key;
+}
+
+bool SameVertexLayout(const VertexInputLayout& first, const VertexInputLayout& second) {
+    const auto sameBinding = [](const VkVertexInputBindingDescription& a, const VkVertexInputBindingDescription& b) { return a.binding == b.binding && a.stride == b.stride && a.inputRate == b.inputRate; };
+    const auto sameAttribute = [](const VkVertexInputAttributeDescription& a, const VkVertexInputAttributeDescription& b) { return a.location == b.location && a.binding == b.binding && a.format == b.format && a.offset == b.offset; };
+    return std::ranges::equal(first.bindings, second.bindings, sameBinding) && std::ranges::equal(first.attributes, second.attributes, sameAttribute);
+}
+
+bool EarlyTemplates() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_EARLY_DRAW_FIND");
+        return (value == nullptr || std::string_view(value) != "0") && std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") == nullptr && std::getenv("APS5_NO_TEXTURE_CACHE") == nullptr && std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    }();
+    return enabled;
+}
+
+void CountEarlyTemplate(int outcome) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::array<std::atomic<std::uint64_t>, 3> counts{};
+    static std::atomic<std::int64_t> last{0};
+    counts[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto seen = last.load(std::memory_order_relaxed);
+    if (seen == 0) last.compare_exchange_strong(seen, now);
+    else if (now - seen >= 10 && last.compare_exchange_strong(seen, now)) {
+        std::fprintf(stderr, "[draw] early templates (10 s): used %llu, left the cache before the commit %llu, none found by the preparer %llu\n", static_cast<unsigned long long>(counts[0].exchange(0)), static_cast<unsigned long long>(counts[1].exchange(0)), static_cast<unsigned long long>(counts[2].exchange(0)));
+    }
+}
+
 EarlyDrawKey* TakeEarlyDrawKey(const State& state, std::span<const CompiledShader> shaders) {
     auto& slot = earlyDrawKey;
     if (slot.key == nullptr || slot.state != &state || slot.shaders != shaders.data() || slot.count != shaders.size() || slot.key->key.empty()) return nullptr;
-    auto* key = slot.key;
-    slot = {};
-    return key;
+    return slot.key;
 }
 
 // A draw's resources (resolveDrawResources): the resource-cache template a recordable draw's
@@ -1596,9 +1642,13 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
         auto* early = trimKey ? TakeEarlyDrawKey(state, shaders) : nullptr;
+        static const bool verifyEarly = std::getenv("APS5_VERIFY_DRAW_KEY") != nullptr;
+        bool earlyKey = false;
+        std::shared_ptr<ShaderResources> earlyResources;
         if (early != nullptr && early->key.size() >= 3 && early->key[1] == static_cast<std::uint32_t>(reinterpret_cast<std::uint64_t>(context.device)) && early->key[2] == static_cast<std::uint32_t>(reinterpret_cast<std::uint64_t>(context.device) >> 32u)) {
             resolved.contentKey = std::move(early->key);
-            static const bool verifyEarly = std::getenv("APS5_VERIFY_DRAW_KEY") != nullptr;
+            earlyResources = std::move(early->resources);
+            earlyKey = true;
             if (verifyEarly) Require(resolved.contentKey == DrawResourceKey(context.device, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, false), "APS5_VERIFY_DRAW_KEY: the resource key built on the draw thread differs from the committer's");
         } else {
             resolved.contentKey = DrawResourceKey(context.device, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
@@ -1609,7 +1659,15 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             noteLookupKey(shaders, resolved.contentKey, early != nullptr);
             timer.phaseStart = std::chrono::steady_clock::now();
         }
-        auto cached = SharedResourceCache().Find(resolved.contentKey);
+        std::shared_ptr<ShaderResources> cached;
+        if (earlyResources != nullptr && earlyResources->InResourceCache()) {
+            cached = std::move(earlyResources);
+            CountEarlyTemplate(0);
+            if (verifyEarly) Require(cached == SharedResourceCache().Find(resolved.contentKey), "APS5_VERIFY_DRAW_KEY: the resource template the preparer found is not the one the cache holds at the commit");
+        } else {
+            if (earlyKey && EarlyTemplates()) CountEarlyTemplate(earlyResources != nullptr ? 1 : 2);
+            cached = SharedResourceCache().Find(resolved.contentKey);
+        }
         timer.phase(PhaseLookupFind);
         if (cached) {
             const bool valid = cached->Revalidate(shaders);
@@ -2292,6 +2350,30 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
 // The state with the outputs the pixel shader lacks masked: Vulkan leaves attachments a pixel
 // shader has no output for undefined, so their writes are masked (shaders that only store to
 // images or buffers keep their targets as they were). Empty when no mask must change.
+std::optional<State> maskedState(const State& state, std::uint32_t fragmentOutputs);
+
+void CountEarlyPipeline(int outcome) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::array<std::atomic<std::uint64_t>, 4> counts{};
+    static std::atomic<std::int64_t> last{0};
+    counts[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto seen = last.load(std::memory_order_relaxed);
+    if (seen == 0) last.compare_exchange_strong(seen, now);
+    else if (now - seen >= 10 && last.compare_exchange_strong(seen, now)) {
+        std::fprintf(stderr, "[draw] early pipelines (10 s): used %llu, none from the preparer %llu, not usable (layout, proxy, stencil or vertex input differ) %llu\n", static_cast<unsigned long long>(counts[0].exchange(0)), static_cast<unsigned long long>(counts[1].exchange(0)), static_cast<unsigned long long>(counts[2].exchange(0)));
+    }
+}
+
+bool EarlyPipelines() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_EARLY_DRAW_PIPELINE");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
 std::optional<State> maskedState(const State& state, std::uint32_t fragmentOutputs) {
     std::optional<State> masked;
     for (std::size_t index = 0; index < state.blends.size(); ++index) {
@@ -2338,13 +2420,60 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-EarlyDrawKey BuildEarlyDrawKey(VkDevice device, const State& state, std::span<const CompiledShader> shaders) {
-    static const bool disabled = [] {
+bool EarlyDrawKeys() {
+    static const bool enabled = [] {
         const char* value = std::getenv("APS5_EARLY_DRAW_KEY");
-        return value == nullptr || std::string_view(value) != "1";
+        return value != nullptr && std::string_view(value) == "1";
     }();
-    if (disabled || shaders.empty() || !std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; })) return {};
-    return {DrawResourceKey(device, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), 0, 0, false)};
+    return enabled;
+}
+
+EarlyDrawKey BuildEarlyDrawKey(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+    if (!EarlyDrawKeys() || shaders.empty() || !std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; })) return {};
+    EarlyDrawKey early{DrawResourceKey(context.device, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), 0, 0, false)};
+    if (EarlyTemplates() && !ShaderResources::NeverReusable(shaders)) early.resources = SharedResourceCache().Peek(early.key);
+    static const bool inputs = [] {
+        const char* value = std::getenv("APS5_EARLY_DRAW_INPUTS");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    if (!inputs) return early;
+    try {
+        bool memoized = false;
+        bool hit = false;
+        early.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, memoized, hit);
+        early.shaderStages = PipelineStages(shaders);
+        ValidateViewport(context, state.viewport);
+        ValidateDepthBounds(context, state);
+        ValidateSampleMask(context, state, shaders);
+        early.validated = true;
+    } catch (const std::exception&) {
+        early.validated = false;
+    }
+    const auto& attributes = shaders.front().program->vertexAttributes;
+    if (!attributes.empty()) {
+        try {
+            if (context.vertexInputs != nullptr) early.vertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+            if (early.vertexInput == nullptr) early.vertexInput = std::make_shared<const VertexInputLayout>(BuildVertexInputLayout(context, attributes));
+        } catch (const std::exception&) {
+            early.vertexInput = nullptr;
+        }
+    }
+    const bool stencilReplay = std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.program->stencilReferences.empty(); });
+    const bool proxied = std::any_of(state.colors.begin(), state.colors.end(), [&](const ColorTarget& color) { return AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED; });
+    if (EarlyPipelines() && early.validated && context.descriptorCache != nullptr && (attributes.empty() || early.vertexInput != nullptr) && !stencilReplay && !proxied && !state.quadList) {
+        try {
+            static const VertexInputLayout noVertexInput;
+            const auto described = DescribeSetLayouts(context, shaders);
+            const auto masked = maskedState(state, early.fragmentOutputs);
+            early.pipeline = CachedPipeline(context, masked.has_value() ? *masked : state, early.vertexInput != nullptr ? *early.vertexInput : noVertexInput, described.View(), shaders, VK_IMAGE_LAYOUT_GENERAL, nullptr, true);
+            early.mainLayout = described.layouts.main;
+            early.fragmentLayout = described.layouts.fragment;
+            early.splitLayouts = described.layouts.split;
+        } catch (const std::exception&) {
+            early.pipeline = nullptr;
+        }
+    }
+    return early;
 }
 
 EarlyDrawKeyScope::EarlyDrawKeyScope(EarlyDrawKey& key, const State& state, std::span<const CompiledShader> shaders) {
@@ -2708,7 +2837,20 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         committerSplit().draws.fetch_add(1, std::memory_order_relaxed);
         reportCommitterSplit();
     }
-    auto pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    std::shared_ptr<Pipeline> pipeline;
+    const auto* earlyDraw = PeekEarlyDrawKey(state, shaders);
+    if (earlyDraw != nullptr && earlyDraw->pipeline == nullptr) CountEarlyPipeline(1);
+    if (const auto* early = earlyDraw; early != nullptr && early->pipeline != nullptr) {
+        const auto layouts = resources->SetLayouts();
+        const bool usable = stencilReplay.empty() && lean && std::none_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; }) && layouts.main == early->mainLayout && layouts.fragment == early->fragmentLayout && layouts.split == early->splitLayouts && (inputs.retainedVertexInput == early->vertexInput || (early->vertexInput == nullptr && inputs.VertexLayout().attributes.empty()));
+        CountEarlyPipeline(usable ? 0 : 2);
+        if (usable) {
+            pipeline = early->pipeline;
+            static const bool verifyEarlyPipeline = std::getenv("APS5_VERIFY_DRAW_KEY") != nullptr;
+            if (verifyEarlyPipeline) Require(CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, VK_IMAGE_LAYOUT_GENERAL) == pipeline, "APS5_VERIFY_DRAW_KEY: the pipeline found by the preparer differs from the committer's");
+        }
+    }
+    if (pipeline == nullptr) pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
     if (profilePipeline) committerSplit().pipelineLookup.fetch_add(CommitterSinceNs(pipelineMark), std::memory_order_relaxed);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.

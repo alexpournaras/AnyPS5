@@ -49,6 +49,13 @@ void forEachKeyedUserWord(const QueueState& queue, bool allUserWords, TVisit&& v
 
 }
 
+void TrackRegisterFingerprints(const QueueState& queue) {
+    const auto& masks = registerMasks();
+    static_cast<void>(queue.context.Fingerprint(masks[static_cast<std::size_t>(Graphics::RegisterBank::Context)]));
+    static_cast<void>(queue.shader.Fingerprint(masks[static_cast<std::size_t>(Graphics::RegisterBank::Shader)]));
+    static_cast<void>(queue.userConfig.Fingerprint(masks[static_cast<std::size_t>(Graphics::RegisterBank::UserConfig)]));
+}
+
 std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool incremental, std::uint64_t* shapeKey, RegisterStateKeyParts* parts) {
     const auto& masks = registerMasks();
     const auto fingerprint = [&](const Registers& registers, Graphics::RegisterBank bank) {

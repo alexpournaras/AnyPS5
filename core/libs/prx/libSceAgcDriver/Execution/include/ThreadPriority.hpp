@@ -28,6 +28,7 @@ struct RealtimePlan {
 ThreadPriorityMode ParseThreadPriorityMode(const char* text);
 RealtimePlan PlanRealtime(std::uint32_t priority, const std::optional<RtkitLimits>& rtkit, RttimeLimit current, std::uint64_t requestedUs);
 void RaiseWorkerThreadPriority(const char* role);
+void PinDrawThread(const char* role);
 
 }
 

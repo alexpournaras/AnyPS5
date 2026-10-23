@@ -9,11 +9,13 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <fstream>
 #include <sched.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -304,6 +306,83 @@ RealtimePlan PlanRealtime(std::uint32_t priority, const std::optional<RtkitLimit
 void RaiseWorkerThreadPriority(const char* role) {
     if (RequestedMode() == ThreadPriorityMode::Off) return;
     Raise(role);
+}
+
+namespace {
+
+std::vector<std::uint64_t> SharedCacheMasks() {
+    std::vector<std::uint64_t> masks;
+#ifdef _WIN32
+    DWORD bytes = 0;
+    GetLogicalProcessorInformationEx(RelationCache, nullptr, &bytes);
+    std::vector<std::byte> buffer(bytes);
+    if (bytes == 0 || !GetLogicalProcessorInformationEx(RelationCache, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &bytes)) return masks;
+    for (DWORD offset = 0; offset < bytes;) {
+        const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+        if (entry->Relationship == RelationCache && entry->Cache.Level == 3 && entry->Cache.GroupMask.Group == 0) masks.push_back(static_cast<std::uint64_t>(entry->Cache.GroupMask.Mask));
+        offset += entry->Size;
+    }
+#else
+    for (unsigned cpu = 0; cpu < 64; ++cpu) {
+        const auto base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cache/index3/";
+        std::ifstream level(base + "level");
+        int value = 0;
+        if (!(level >> value) || value != 3) continue;
+        std::ifstream list(base + "shared_cpu_list");
+        std::string text;
+        if (!std::getline(list, text)) continue;
+        std::uint64_t mask = 0;
+        for (std::size_t cursor = 0; cursor < text.size();) {
+            const auto first = std::stoul(text.substr(cursor), &cursor);
+            auto last = first;
+            if (cursor < text.size() && text[cursor] == '-') {
+                std::size_t used = 0;
+                last = std::stoul(text.substr(cursor + 1), &used);
+                cursor += used + 1;
+            }
+            for (auto bit = first; bit <= last && bit < 64; ++bit) mask |= std::uint64_t{1} << bit;
+            if (cursor < text.size() && text[cursor] == ',') ++cursor;
+        }
+        masks.push_back(mask);
+    }
+#endif
+    std::sort(masks.begin(), masks.end());
+    masks.erase(std::unique(masks.begin(), masks.end()), masks.end());
+    return masks;
+}
+
+}
+
+void PinDrawThread(const char* role) {
+    const char* roleVariable = std::strcmp(role, "draw committer") == 0 ? "APS5_PIN_COMMITTER" : std::strcmp(role, "draw preparer") == 0 ? "APS5_PIN_PREPARERS" : "APS5_PIN_PACKETS";
+    const char* roleMask = std::getenv(roleVariable);
+    const char* group = std::getenv("APS5_DRAW_THREADS_L3");
+    std::uint64_t mask = 0;
+    char line[128];
+    if (roleMask != nullptr && *roleMask != '\0') {
+        mask = std::strtoull(roleMask, nullptr, 16);
+        if (mask == 0) throw std::runtime_error(std::string(roleVariable) + "=" + roleMask + " is not a nonzero hexadecimal processor mask");
+        std::snprintf(line, sizeof(line), "pinned to processors 0x%llx (%s)", static_cast<unsigned long long>(mask), roleVariable);
+    } else if (group != nullptr && *group != '\0') {
+        static const auto masks = SharedCacheMasks();
+        const auto index = std::strtoul(group, nullptr, 10);
+        if (index >= masks.size()) throw std::runtime_error(std::string("APS5_DRAW_THREADS_L3=") + group + ": this machine has " + std::to_string(masks.size()) + " L3 cache groups");
+        mask = masks[index];
+        std::snprintf(line, sizeof(line), "pinned to L3 group %lu of %zu (mask 0x%llx)", index, masks.size(), static_cast<unsigned long long>(mask));
+    } else {
+        return;
+    }
+#ifdef _WIN32
+    if (SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(mask)) == 0) throw std::runtime_error(std::string("draw thread pinning: ") + role + " SetThreadAffinityMask failed (error " + std::to_string(GetLastError()) + ")");
+#else
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (unsigned bit = 0; bit < 64; ++bit) {
+        if ((mask >> bit) & 1u) CPU_SET(bit, &set);
+    }
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) throw std::runtime_error(std::string("draw thread pinning: ") + role + " sched_setaffinity failed");
+#endif
+    LogOnce(role, line);
 }
 
 }

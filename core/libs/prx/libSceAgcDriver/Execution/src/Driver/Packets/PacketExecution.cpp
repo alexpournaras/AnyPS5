@@ -3,6 +3,8 @@
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPreparers.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -72,6 +74,20 @@ bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t head
     }
 }
 
+bool runsBesidePreparers(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool predicated, const Submission& submission, std::size_t cursor) {
+    if (predicated || header == FlipPacketHeader || header == RenderingWaitPacketHeader || submission.flips.contains(cursor)) return false;
+    if (Pm4::DrawOpcode(opcode)) return !Pm4::IndirectDrawOpcode(opcode);
+    switch (opcode) {
+        case 0x11: case 0x12: case 0x13: case 0x20: case 0x26: case 0x2a: case 0x2f: case 0x69: case 0x76: case 0x79: case 0x7a: return true;
+        case 0x63: case 0x64: case 0x9f: return Pm4::IndirectRegistersValid(submission.registerLists.at(cursor));
+        case 0x10: {
+            const auto operation = (header >> 2u) & 0x3fu;
+            return operation == 0 || operation == 0x0b || operation == 0x0c || operation == 0x1a;
+        }
+        default: return false;
+    }
+}
+
 bool sealsWriteOnly(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
     if (opcode == 0x58) return true;
     if (opcode != 0x46 || packet.size() < 2) return false;
@@ -121,6 +137,81 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
     if (report && bucket != &WorkerProfile::waitMs) PerformanceCounters::AddDriverNanoseconds(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count()));
 }
 
+bool Driver::runDrawPacket(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t cursor) {
+    bool drawn = false;
+    static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
+    static const bool profileDraws = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto color = (static_cast<std::uint64_t>(readRegister(queue.context, 0x390)) << 40u) | (static_cast<std::uint64_t>(readRegister(queue.context, 0x318)) << 8u);
+    const auto started = profileDraws ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto countSkip = [&](Graphics::DrawSkip kind) {
+        if (profileDraws) Graphics::CountDrawSkip(kind, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count());
+    };
+
+    try {
+        std::string rejected;
+        const auto verdict = draw(queue, packet, submission, rejected);
+        drawn = verdict == DrawVerdict::Drawn;
+        CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
+        if (verdict == DrawVerdict::Rejected) {
+            countSkip(Graphics::DrawSkip::Prechecked);
+            throw std::runtime_error(rejected);
+        } else if (verdict == DrawVerdict::Nothing) {
+            countSkip(Graphics::DrawSkip::Nothing);
+        } else if (traceDraws) {
+            std::fprintf(stderr, "[draw] target 0x%llx mask 0x%x ok\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e));
+        }
+    } catch (const RefusedDraw& refused) {
+        CaptureTrace::Log("draw-refused submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, refused.what());
+        countSkip(Graphics::DrawSkip::Thrown);
+        ReportRefusedDraw(refused);
+    } catch (const std::exception& error) {
+        CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
+        countSkip(Graphics::DrawSkip::Thrown);
+        throw;
+    }
+    return drawn;
+}
+
+void Driver::prepareDrawAhead(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint32_t opcode) {
+    const auto cursor = static_cast<std::size_t>(packet.data() - submission.commands.data());
+    const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+    TrackRegisterFingerprints(queue);
+    static thread_local bool preparerDeviceUse = false;
+    static const bool idleRelease = (DrawPreparers::Queue0().OnIdle([this] {
+        if (!preparerDeviceUse) return;
+        deviceReplacement.unlock_shared();
+        preparerDeviceUse = false;
+    }), true);
+    static_cast<void>(idleRelease);
+    DrawPreparers::Queue0().Submit(queue, [this, packet, &submission, cursor, opcode, epoch](const QueueState& state) {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        DrawPipeline::FollowEpoch(epoch);
+        GuestMemory::SetCurrentPacket(opcode, submission.queue);
+        if (!preparerDeviceUse) {
+            deviceReplacement.lock_shared();
+            preparerDeviceUse = true;
+        }
+        const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (profile) {
+            packetStartedAt() = start;
+            pendingDrawPhases() = {};
+        }
+        bool drawn = false;
+        timed(&WorkerProfile::drawMs, [&] { drawn = runDrawPacket(state, packet, submission, cursor); });
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        auto& pending = pendingDrawPhases();
+        std::array<double, DrawDriverPhaseCount> ms{};
+        if (drawn && pending.phases) {
+            ms = pending.ms;
+            ms[DrawRowEpilogue] = std::chrono::duration<double, std::milli>(now - pending.tailAt).count();
+        } else {
+            ms[DrawRowSkipped] = std::chrono::duration<double, std::milli>(now - start).count();
+        }
+        addDrawPhases(ms, drawn && pending.phases, pending.captures);
+    });
+}
+
 void Driver::execute(const Submission& submission) {
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
@@ -136,6 +227,7 @@ void Driver::execute(const Submission& submission) {
     const bool pipelined = submission.queue == 0 && DrawPipeline::Depth() != 0;
     static const bool orderedWaits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
     DrawPipeline::Active() = pipelined;
+    const bool preparing = pipelined && DrawPreparers::Threads() != 0;
     struct PipelineDrain {
         bool pipelined;
         ~PipelineDrain() {
@@ -239,6 +331,7 @@ void Driver::execute(const Submission& submission) {
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (preparing && DrawPreparers::Queue0().Busy() && !runsBesidePreparers(packet, header, opcode, predicated, submission, cursor)) DrawPreparers::Queue0().Wait(header == FlipPacketHeader ? 0xffu : opcode);
         if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
@@ -423,40 +516,15 @@ void Driver::execute(const Submission& submission) {
             landPendingWaits(submission.queue);
             packetCounters.CountDraw();
             drawnSinceSeal() = true;
-            bool drawn = false;
-            timed(&WorkerProfile::drawMs, [&] {
-                static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
-                static const bool profileDraws = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-                const auto color = (static_cast<std::uint64_t>(readRegister(queue.context, 0x390)) << 40u) | (static_cast<std::uint64_t>(readRegister(queue.context, 0x318)) << 8u);
-                const auto started = profileDraws ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                const auto countSkip = [&](Graphics::DrawSkip kind) {
-                    if (profileDraws) Graphics::CountDrawSkip(kind, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count());
-                };
-
-                try {
-                    std::string rejected;
-                    const auto verdict = draw(queue, packet, submission, rejected);
-                    drawn = verdict == DrawVerdict::Drawn;
-                    CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
-                    if (verdict == DrawVerdict::Rejected) {
-                        countSkip(Graphics::DrawSkip::Prechecked);
-                        throw std::runtime_error(rejected);
-                    } else if (verdict == DrawVerdict::Nothing) {
-                        countSkip(Graphics::DrawSkip::Nothing);
-                    } else if (traceDraws) {
-                        std::fprintf(stderr, "[draw] target 0x%llx mask 0x%x ok\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e));
-                    }
-                } catch (const RefusedDraw& refused) {
-                    CaptureTrace::Log("draw-refused submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, refused.what());
-                    countSkip(Graphics::DrawSkip::Thrown);
-                    ReportRefusedDraw(refused);
-                } catch (const std::exception& error) {
-                    CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
-                    countSkip(Graphics::DrawSkip::Thrown);
-                    throw;
-                }
-            });
-            finishDrawPacket(drawn);
+            if (preparing && !predicated && !Pm4::IndirectDrawOpcode(opcode) && deferredLabels().labels.empty() && device.Load() != nullptr) {
+                if (deviceUse.owns_lock()) deviceUse.unlock();
+                prepareDrawAhead(queue, packet, submission, opcode);
+            } else {
+                if (preparing) DrawPreparers::Queue0().Wait(opcode);
+                bool drawn = false;
+                timed(&WorkerProfile::drawMs, [&] { drawn = runDrawPacket(queue, packet, submission, cursor); });
+                finishDrawPacket(drawn);
+            }
         } else if (opcode == 0x22) {
             landPendingWaits(submission.queue);
             recordQueuedLabelsBeforeRead(submission.queue);
@@ -518,6 +586,7 @@ void Driver::execute(const Submission& submission) {
         else timing.Finish();
         cursor = nextCursor;
     }
+    if (preparing) DrawPreparers::Queue0().Wait();
 
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");

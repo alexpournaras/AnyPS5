@@ -21,10 +21,23 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 
+struct VertexInputLayout;
+class ShaderResources;
+
 struct EarlyDrawKey {
     std::vector<std::uint32_t> key;
+    std::shared_ptr<ShaderResources> resources;
+    bool validated = false;
+    std::uint32_t fragmentOutputs = 0;
+    VkPipelineStageFlags shaderStages = 0;
+    std::shared_ptr<const VertexInputLayout> vertexInput;
+    std::shared_ptr<Pipeline> pipeline;
+    VkDescriptorSetLayout mainLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout fragmentLayout = VK_NULL_HANDLE;
+    bool splitLayouts = false;
 };
-EarlyDrawKey BuildEarlyDrawKey(VkDevice device, const State& state, std::span<const CompiledShader> shaders);
+bool EarlyDrawKeys();
+EarlyDrawKey BuildEarlyDrawKey(const Context& context, const State& state, std::span<const CompiledShader> shaders);
 
 class EarlyDrawKeyScope {
 public:

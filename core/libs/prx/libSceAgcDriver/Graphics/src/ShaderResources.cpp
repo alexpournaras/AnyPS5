@@ -3847,6 +3847,25 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     return found->second->second;
 }
 
+std::shared_ptr<ShaderResources> ResourceCache::Peek(const Key& key) {
+    const auto hash = KeyHash{}(key);
+    std::lock_guard lock(mutex);
+    const auto found = index.find(HashedKey{key, hash});
+    if (found == index.end()) return nullptr;
+    resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
+    entries.splice(entries.begin(), entries, found->second);
+    noteUse(hash);
+    return found->second->second;
+}
+
+void ResourceCache::entered(ShaderResources& resources) {
+    resources.resourceCacheEntries.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void ResourceCache::left(ShaderResources& resources) {
+    resources.resourceCacheEntries.fetch_sub(1, std::memory_order_acq_rel);
+}
+
 void ResourceCache::noteEvicted(const Key& key) {
     if (fixedCapacity) return;
     const auto hash = KeyHash{}(key);
@@ -4019,10 +4038,12 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     dropReleasedTextures(evicted);
     if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;
     if (const auto found = index.find(key); found != index.end()) {
+        left(*found->second->second);
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
         entries.erase(found->second);
         index.erase(found);
     }
+    entered(*resources);
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
     if (capacity == 0) {
@@ -4034,6 +4055,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     noteUse(KeyHash{}(key));
     while (entries.size() > capacity) {
         noteEvicted(entries.back().first);
+        left(*entries.back().second);
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
         index.erase(entries.back().first);
         entries.pop_back();
@@ -4048,6 +4070,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
             continue;
         }
         tables -= elements;
+        left(*it->second);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = std::prev(entries.erase(it));
@@ -4070,6 +4093,7 @@ void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
+        left(*it->second);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
@@ -4083,6 +4107,7 @@ void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResou
             ++it;
             continue;
         }
+        left(*it->second);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
@@ -4110,6 +4135,7 @@ std::uint64_t ResourceCache::Touches() {
 
 void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
+    for (auto& entry : entries) left(*entry.second);
     index.clear();
     entries.clear();
     evictedKeys.clear();
@@ -4158,6 +4184,7 @@ std::uint64_t ResourceCache::TableElements() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
+    left(*found->second->second);
     entries.erase(found->second);
     index.erase(found);
 }

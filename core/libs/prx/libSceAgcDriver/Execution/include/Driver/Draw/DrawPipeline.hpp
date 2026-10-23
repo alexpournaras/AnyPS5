@@ -32,8 +32,16 @@ public:
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
+    static void NoteCommitParts(std::uint64_t lockNs, std::uint64_t beforeNs, std::uint64_t drawNs, bool indexed);
+
+    struct Handed {
+        Commit commit;
+        std::vector<Range> writes;
+        std::vector<Range> reads;
+    };
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {});
+    void EnqueueBatch(std::vector<Handed>& batch);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
@@ -61,9 +69,14 @@ private:
     };
     DrawPipeline() = default;
     void addWrites(const std::vector<Range>& writes);
+    void place(std::unique_lock<std::mutex>& lock, Item item);
     void removeWrites(const std::vector<Range>& writes);
     bool scanOverlaps(std::span<const Range> ranges) const;
     void run();
+    static void awaitPreparedOrder(std::uint32_t opcode = 0x100);
+    static bool releaseOnEnqueue();
+    static std::size_t roomBatch();
+    bool roomFor() const { return items.size() + roomBatch() <= Depth(); }
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
 
@@ -71,6 +84,7 @@ private:
     std::condition_variable wake;
     std::condition_variable idle;
     std::deque<Item> items;
+    std::vector<Item> released;
     std::vector<QueuedWrite> queuedWrites;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
@@ -82,6 +96,10 @@ private:
     std::uint64_t commits = 0;
     std::uint64_t commitNs = 0;
     std::uint64_t commitErrors = 0;
+    std::uint64_t idleNs = 0;
+    std::uint64_t relockNs = 0;
+    std::uint64_t releaseNs = 0;
+    std::uint64_t bookkeepNs = 0;
     std::uint64_t enqueued = 0;
     std::uint64_t fullWaitNs = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drains{};
